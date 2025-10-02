@@ -12,8 +12,18 @@ Components:
 """
 
 from resonagraph.gossip.beacon import Beacon, BeaconMetadata
+from resonagraph.gossip.dht import (
+    KademliaDHT,
+    Node,
+    BloomFilter,
+    compute_prime_hash
+)
 
 __all__ = [
     'Beacon',
     'BeaconMetadata',
+    'KademliaDHT',
+    'Node',
+    'BloomFilter',
+    'compute_prime_hash',
 ]
