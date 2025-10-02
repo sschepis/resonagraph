@@ -1,0 +1,15 @@
+# Core dependencies for ResonaGraph
+# According to copilot-instructions.md:
+# - NumPy/SciPy for entropy simulations and phase computations
+# - Crypto: HMAC-SHA256, HKDF (built into Python)
+# Note: Some dependencies like QUIC (quiche), GMP, RocksDB require system libraries
+# and will be added in later phases
+
+# Numerical computing
+numpy>=1.24.0
+scipy>=1.10.0
+
+# Future dependencies (commented for now):
+# rocksdb>=0.7.0  # Storage layer (Phase 1)
+# aioquic>=0.9.0  # QUIC protocol (Phase 2)
+# lz4>=4.0.0      # Compression (Phase 7)
