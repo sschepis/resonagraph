@@ -9,9 +9,12 @@ Implements the core operations from design.md Section 4.1:
 """
 
 from typing import Dict, Any, Optional, List
+from cryptography.hazmat.primitives.asymmetric import ed25519
+
 from resonagraph.core.phase_key import PhaseKey
 from resonagraph.core.prime_selection import PrimeSelector
 from resonagraph.core.phase_encoding import PhaseEncoder
+from resonagraph.gossip import Beacon, GossipManager, KademliaDHT
 
 
 class Client:
@@ -22,16 +25,26 @@ class Client:
     Core operations: put, get, traverse, query
     """
     
-    def __init__(self, endpoint: str):
+    def __init__(self, endpoint: str, enable_gossip: bool = False):
         """
         Initialize ResonaGraph client.
         
         Args:
             endpoint: API endpoint URL (e.g., "https://api.resonagraph.com/v1")
+            enable_gossip: Enable local gossip manager (for testing/development)
         """
         self.endpoint = endpoint
         self._prime_selector = PrimeSelector()
         self._phase_encoder = PhaseEncoder()
+        
+        # Gossip plane (optional, for testing)
+        self._gossip_manager: Optional[GossipManager] = None
+        if enable_gossip:
+            dht = KademliaDHT(address=endpoint)
+            self._gossip_manager = GossipManager(dht, address=endpoint)
+        
+        # Signing key for beacons (would be configured in production)
+        self._signing_key: Optional[ed25519.Ed25519PrivateKey] = None
     
     def put(
         self,
@@ -68,27 +81,42 @@ class Client:
         
         # Encode payload
         encoder = PhaseEncoder(taper_alpha=taper_alpha)
-        phase_angles = encoder.encode_payload(
+        phase_angles_dict = encoder.encode_payload(
             payload, primes, phase_key.get_bytes()
         )
         
-        # Create beacon metadata
-        beacon = {
+        # Convert dict to flat list of phase angles for beacon
+        phase_angles = []
+        for prime in primes:
+            if prime in phase_angles_dict:
+                phase_angles.extend(phase_angles_dict[prime])
+        
+        # Create beacon (with signature if gossip enabled)
+        beacon = Beacon(
+            key=key,
+            primes=primes,
+            phase_angles=phase_angles,
+            signing_key=self._signing_key,
+            mac_key=phase_key.get_bytes()
+        )
+        
+        # Publish beacon via gossip if enabled
+        if self._gossip_manager:
+            self._gossip_manager.publish_beacon(key, beacon)
+        
+        # Return beacon metadata
+        return {
             'key': key,
             'primes': primes,
-            'phase_angles': phase_angles,
+            'phase_angles': phase_angles_dict,  # Return original dict format
+            'epoch': beacon.epoch,
+            'phase_fingerprint': beacon.phase_fingerprint,
+            'beacon_size': beacon.size(),
             'options': {
                 'k_primes': k_primes,
                 'taper_alpha': taper_alpha
             }
         }
-        
-        # In a full implementation, this would:
-        # 1. Store encoded phases locally
-        # 2. Create and sign beacon
-        # 3. Gossip beacon to network
-        
-        return beacon
     
     def get(
         self,
@@ -108,6 +136,26 @@ class Client:
         Returns:
             Dict with payload and metrics
         """
+        # If gossip enabled, try to fetch beacon
+        if self._gossip_manager:
+            # Select primes for this key (same as in put)
+            primes = self._prime_selector.select_primes(key)
+            
+            # Query beacon from gossip manager
+            beacon = self._gossip_manager.query_beacon(primes)
+            
+            if beacon:
+                return {
+                    'payload': {},  # Would reconstruct via CRT in Phase 3
+                    'beacon_found': True,
+                    'epoch': beacon.epoch,
+                    'phase_fingerprint': beacon.phase_fingerprint,
+                    'metrics': {
+                        'lock_time': 0.0,
+                        'entropy_final': 0.0
+                    }
+                }
+        
         # In a full implementation, this would:
         # 1. Fetch beacons for key's primes
         # 2. Synthesize probe |Q⟩
@@ -118,6 +166,7 @@ class Client:
         # Placeholder implementation
         return {
             'payload': {},
+            'beacon_found': False,
             'metrics': {
                 'lock_time': 0.0,
                 'entropy_final': 0.0
