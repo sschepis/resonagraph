@@ -18,6 +18,7 @@ from resonagraph.core.phase_encoding import PhaseEncoder
 from resonagraph.api.client import Client
 from resonagraph.core.phase_key import PhaseKey
 from resonagraph.api.query import Query
+from resonagraph.resonance import ProbeSynthesizer, ResonanceLock, ResidueExtractor
 
 __all__ = [
     "Client",
@@ -25,4 +26,7 @@ __all__ = [
     "Query",
     "PrimeSelector",
     "PhaseEncoder",
+    "ProbeSynthesizer",
+    "ResonanceLock",
+    "ResidueExtractor",
 ]

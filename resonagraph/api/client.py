@@ -15,6 +15,7 @@ from resonagraph.core.phase_key import PhaseKey
 from resonagraph.core.prime_selection import PrimeSelector
 from resonagraph.core.phase_encoding import PhaseEncoder
 from resonagraph.gossip import Beacon, GossipManager, KademliaDHT
+from resonagraph.resonance import ProbeSynthesizer, ResonanceLock, ResidueExtractor
 
 
 class Client:
@@ -37,6 +38,11 @@ class Client:
         self._prime_selector = PrimeSelector()
         self._phase_encoder = PhaseEncoder()
         
+        # Resonance plane components (Phase 3)
+        self._probe_synthesizer = ProbeSynthesizer()
+        self._resonance_lock = ResonanceLock()
+        self._residue_extractor = ResidueExtractor()
+        
         # Gossip plane (optional, for testing)
         self._gossip_manager: Optional[GossipManager] = None
         if enable_gossip:
@@ -45,6 +51,10 @@ class Client:
         
         # Signing key for beacons (would be configured in production)
         self._signing_key: Optional[ed25519.Ed25519PrivateKey] = None
+        
+        # Local storage for encoded data (simulated)
+        # In production, this would be RocksDB
+        self._storage: Dict[str, Dict[int, List[float]]] = {}
     
     def put(
         self,
@@ -104,6 +114,9 @@ class Client:
         if self._gossip_manager:
             self._gossip_manager.publish_beacon(key, beacon)
         
+        # Store phases locally for later retrieval (simulated storage)
+        self._storage[key] = phase_angles_dict
+        
         # Return beacon metadata
         return {
             'key': key,
@@ -121,57 +134,119 @@ class Client:
     def get(
         self,
         key: str,
-        phase_key: PhaseKey
+        phase_key: PhaseKey,
+        options: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
         Retrieve by resonance locking.
         
-        According to design.md Section 4.1:
+        According to design.md Section 4.1 and Section 2.3 (Algo 2):
+        1. Hash key → Select P(a)
+        2. Fetch beacons (or use local storage)
+        3. Synthesize probe |Q⟩
+        4. Perform resonance locking
+        5. Extract residues
+        6. Reconstruct via CRT
+        
         Returns payload + metrics (lock_time, entropy_final)
         
         Args:
             key: Key to retrieve
             phase_key: Cryptographic phase key
+            options: Optional parameters (k_primes, taper_alpha)
             
         Returns:
             Dict with payload and metrics
         """
-        # If gossip enabled, try to fetch beacon
-        if self._gossip_manager:
-            # Select primes for this key (same as in put)
-            primes = self._prime_selector.select_primes(key)
-            
-            # Query beacon from gossip manager
-            beacon = self._gossip_manager.query_beacon(primes)
-            
-            if beacon:
-                return {
-                    'payload': {},  # Would reconstruct via CRT in Phase 3
-                    'beacon_found': True,
-                    'epoch': beacon.epoch,
-                    'phase_fingerprint': beacon.phase_fingerprint,
-                    'metrics': {
-                        'lock_time': 0.0,
-                        'entropy_final': 0.0
-                    }
+        options = options or {}
+        k_primes = options.get('k_primes', PrimeSelector.DEFAULT_K_PRIMES)
+        taper_alpha = options.get('taper_alpha', 0.1)
+        
+        # Step 1: Select primes for this key
+        prime_selector = PrimeSelector(k_primes=k_primes)
+        primes = prime_selector.select_primes(key)
+        
+        # Step 2: Fetch address phases (from local storage or beacon)
+        address_phases = self._fetch_address_phases(key, primes)
+        
+        if not address_phases:
+            return {
+                'payload': None,
+                'found': False,
+                'metrics': {
+                    'lock_time': 0.0,
+                    'entropy_final': 0.0
                 }
+            }
         
-        # In a full implementation, this would:
-        # 1. Fetch beacons for key's primes
-        # 2. Synthesize probe |Q⟩
-        # 3. Perform resonance locking
-        # 4. Extract residues
-        # 5. Reconstruct via CRT
+        # Step 3: Synthesize probe |Q⟩
+        # Initial probe phases are arbitrary (could be random or zero)
+        import random
+        import math
+        initial_phases = [random.random() * 2 * math.pi for _ in primes]
         
-        # Placeholder implementation
+        probe_synthesizer = ProbeSynthesizer(taper_alpha=taper_alpha)
+        probe = probe_synthesizer.synthesize_probe(
+            primes, initial_phases, use_tapered=True
+        )
+        
+        # Step 4: Perform resonance locking
+        locked_probe, lock_metrics = self._resonance_lock.lock(
+            probe, address_phases, learning_rate=0.1
+        )
+        
+        # Step 5: Extract residues
+        residues = self._residue_extractor.extract_all_residues(
+            locked_probe, address_phases
+        )
+        
+        # Step 6: Reconstruct payload via CRT
+        payload = self._phase_encoder.reconstruct_payload(residues)
+        
+        # Return with metrics
         return {
-            'payload': {},
-            'beacon_found': False,
+            'payload': payload,
+            'found': True,
             'metrics': {
-                'lock_time': 0.0,
-                'entropy_final': 0.0
+                'lock_time': lock_metrics.lock_time,
+                'entropy_final': lock_metrics.final_entropy,
+                'resonance_score': lock_metrics.final_resonance_score,
+                'iterations': lock_metrics.iterations,
+                'converged': lock_metrics.converged,
+                'final_overlap': lock_metrics.final_overlap
             }
         }
+    
+    def _fetch_address_phases(
+        self,
+        key: str,
+        primes: List[int]
+    ) -> Dict[int, List[float]]:
+        """
+        Fetch address phases from local storage or gossip plane.
+        
+        In production, this would query RocksDB or fetch from beacons.
+        
+        Args:
+            key: Key to fetch
+            primes: Primes to fetch phases for
+            
+        Returns:
+            Dict mapping primes to phase lists
+        """
+        # Try local storage first
+        if key in self._storage:
+            return self._storage[key]
+        
+        # Try gossip plane if enabled
+        if self._gossip_manager:
+            beacon = self._gossip_manager.query_beacon(primes)
+            if beacon:
+                # Would decode phases from beacon in production
+                # For now, return empty
+                return {}
+        
+        return {}
     
     def traverse(
         self,
