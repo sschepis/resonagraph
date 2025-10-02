@@ -12,6 +12,8 @@ from .key_hierarchy import KeyHierarchy, KeyRotationScheduler
 from .access_control import AccessControl, AccessPolicy, AccessLevel
 from .signatures import SignatureKeyManager, SignatureKeyPair
 from .integrity import PhaseMAC, ReplayDetector, IntegrityVerifier
+from .audit import AuditLogger, AuditEvent, AuditEventType
+from .anonymization import Anonymizer, AnonymizationLevel, AnonymizedAuditLogger
 
 __all__ = [
     'KeyHierarchy',
@@ -24,4 +26,10 @@ __all__ = [
     'PhaseMAC',
     'ReplayDetector',
     'IntegrityVerifier',
+    'AuditLogger',
+    'AuditEvent',
+    'AuditEventType',
+    'Anonymizer',
+    'AnonymizationLevel',
+    'AnonymizedAuditLogger',
 ]
