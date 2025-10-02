@@ -94,7 +94,17 @@ See [design.md](design.md) for detailed architecture documentation.
 - [x] Client SDK get() method integration
 - [x] Comprehensive tests (55 resonance tests)
 
-### Phase 4-7: See [copilot-instructions.md](.github/copilot-instructions.md)
+### Phase 4: REC (Resonant Eventual Consistency) ✓
+- [x] ConflictCandidate dataclass for epoch tracking
+- [x] RECSimulator for thermodynamic dynamics
+- [x] Entropy decay simulation: S(t) = S_0 e^{-λt}
+- [x] Resonance score growth: RS(t) = RS_★ - (RS_★ - RS_0)e^{-γt}
+- [x] Winner selection: min(S_stable) AND max(RS_stable)
+- [x] Client SDK conflict detection and resolution
+- [x] Multi-epoch storage format
+- [x] Comprehensive tests (30 REC tests: 23 module + 7 integration)
+
+### Phase 5-7: See [copilot-instructions.md](.github/copilot-instructions.md)
 
 ## Key Concepts
 
@@ -121,6 +131,10 @@ See [rec.md](rec.md) for detailed algorithm.
 - [Design Document](design.md) - Complete system architecture
 - [REC Algorithm](rec.md) - Resonant Eventual Consistency details
 - [Copilot Instructions](.github/copilot-instructions.md) - Implementation guidelines
+- [Phase 1 Summary](PHASE1_SUMMARY.md) - Foundation implementation
+- [Phase 2 Summary](PHASE2_SUMMARY.md) - Gossip plane implementation
+- [Phase 3 Summary](PHASE3_SUMMARY.md) - Resonance plane implementation
+- [Phase 4 Summary](PHASE4_SUMMARY.md) - REC conflict resolution implementation
 
 ## Testing
 
@@ -129,6 +143,11 @@ According to copilot-instructions.md testing strategy:
 - **Integration Tests**: Multi-node beacon propagation, conflict resolution
 - **Performance Tests**: Lock time distribution, scaling tests
 - **Fuzz Tests**: Phase perturbations, malformed beacons
+
+Current test coverage:
+- **Phase 1-3**: 146 tests (all passing)
+- **Phase 4 (REC)**: 30 tests (23 module + 7 integration, all passing)
+- **Total**: 176 tests passing, 3 skipped
 
 Run tests:
 ```bash
