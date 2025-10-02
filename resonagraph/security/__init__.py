@@ -6,6 +6,7 @@ This module implements Phase 6 security infrastructure including:
 - Beacon signatures and integrity
 - Audit logging and monitoring
 - Access control policies
+- Security hardening utilities
 """
 
 from .key_hierarchy import KeyHierarchy, KeyRotationScheduler
@@ -14,6 +15,7 @@ from .signatures import SignatureKeyManager, SignatureKeyPair
 from .integrity import PhaseMAC, ReplayDetector, IntegrityVerifier
 from .audit import AuditLogger, AuditEvent, AuditEventType
 from .anonymization import Anonymizer, AnonymizationLevel, AnonymizedAuditLogger
+from .hardening import SecurityHardening, InputValidator
 
 __all__ = [
     'KeyHierarchy',
@@ -32,4 +34,6 @@ __all__ = [
     'Anonymizer',
     'AnonymizationLevel',
     'AnonymizedAuditLogger',
+    'SecurityHardening',
+    'InputValidator',
 ]
