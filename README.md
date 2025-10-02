@@ -104,7 +104,16 @@ See [design.md](design.md) for detailed architecture documentation.
 - [x] Multi-epoch storage format
 - [x] Comprehensive tests (30 REC tests: 23 module + 7 integration)
 
-### Phase 5-7: See [copilot-instructions.md](.github/copilot-instructions.md)
+### Phase 5: APIs and Query Language ✓
+- [x] Query language parser (Cypher subset)
+- [x] COHERE ON resonance extension for coherent subgraph traversal
+- [x] EPOCH WINDOW ±n extension for epoch drift filtering
+- [x] Client.traverse() with Hamiltonian coherence bias (H_G)
+- [x] Client.query() with full execution pipeline
+- [x] Lazy evaluation for partial locks
+- [x] Comprehensive tests (43 API tests: 23 parser + 20 integration)
+
+### Phase 6-7: See [copilot-instructions.md](.github/copilot-instructions.md)
 
 ## Key Concepts
 
@@ -135,6 +144,7 @@ See [rec.md](rec.md) for detailed algorithm.
 - [Phase 2 Summary](PHASE2_SUMMARY.md) - Gossip plane implementation
 - [Phase 3 Summary](PHASE3_SUMMARY.md) - Resonance plane implementation
 - [Phase 4 Summary](PHASE4_SUMMARY.md) - REC conflict resolution implementation
+- [Phase 5 Summary](PHASE5_SUMMARY.md) - APIs and query language implementation
 
 ## Testing
 
@@ -147,7 +157,8 @@ According to copilot-instructions.md testing strategy:
 Current test coverage:
 - **Phase 1-3**: 146 tests (all passing)
 - **Phase 4 (REC)**: 30 tests (23 module + 7 integration, all passing)
-- **Total**: 176 tests passing, 3 skipped
+- **Phase 5 (APIs)**: 43 tests (23 parser + 20 API, all passing)
+- **Total**: 219 tests passing, 3 skipped
 
 Run tests:
 ```bash
