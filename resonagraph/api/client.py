@@ -81,9 +81,15 @@ class Client:
         
         # Encode payload
         encoder = PhaseEncoder(taper_alpha=taper_alpha)
-        phase_angles = encoder.encode_payload(
+        phase_angles_dict = encoder.encode_payload(
             payload, primes, phase_key.get_bytes()
         )
+        
+        # Convert dict to flat list of phase angles for beacon
+        phase_angles = []
+        for prime in primes:
+            if prime in phase_angles_dict:
+                phase_angles.extend(phase_angles_dict[prime])
         
         # Create beacon (with signature if gossip enabled)
         beacon = Beacon(
@@ -102,7 +108,7 @@ class Client:
         return {
             'key': key,
             'primes': primes,
-            'phase_angles': phase_angles,
+            'phase_angles': phase_angles_dict,  # Return original dict format
             'epoch': beacon.epoch,
             'phase_fingerprint': beacon.phase_fingerprint,
             'beacon_size': beacon.size(),
