@@ -243,6 +243,87 @@ class PhaseEncoder:
         # Convert symbols back to bytes
         return self._symbols_to_bytes(symbols)
     
+    def reconstruct_payload(
+        self,
+        residues_per_prime: Dict[int, List[int]]
+    ) -> Dict[str, Any]:
+        """
+        Reconstruct payload from residues using CRT.
+        
+        According to design.md Section 2.2.2:
+        - CRT Reconstruction: m_j = CRT({(r_i, p_i)})
+        - Payload deserialization from symbols
+        
+        Args:
+            residues_per_prime: Dict mapping each prime to list of residues
+            
+        Returns:
+            Reconstructed payload dictionary
+        """
+        if not residues_per_prime:
+            return {}
+        
+        # Determine number of symbols from residue lists
+        num_symbols = max(len(r) for r in residues_per_prime.values())
+        
+        # Reconstruct each symbol using CRT
+        symbols = []
+        primes = list(residues_per_prime.keys())
+        
+        for j in range(num_symbols):
+            # Gather residues for symbol j from all primes
+            symbol_residues = []
+            for prime in primes:
+                if j < len(residues_per_prime[prime]):
+                    residue = residues_per_prime[prime][j]
+                    symbol_residues.append((residue, prime))
+            
+            if symbol_residues:
+                # Apply CRT to reconstruct symbol
+                symbol = self._chinese_remainder_theorem(symbol_residues)
+                symbols.append(symbol)
+        
+        # Convert symbols to bytes
+        payload_bytes = self._symbols_to_bytes(symbols)
+        
+        # Deserialize JSON payload
+        try:
+            payload_str = payload_bytes.decode('utf-8')
+            payload = json.loads(payload_str)
+            return payload
+        except (UnicodeDecodeError, json.JSONDecodeError) as e:
+            # Return raw bytes if deserialization fails
+            return {'_raw_bytes': payload_bytes.hex(), '_error': str(e)}
+    
+    def validate_prime_product(
+        self,
+        primes: List[int],
+        num_bytes: int
+    ) -> bool:
+        """
+        Validate that product of primes is sufficient for byte reconstruction.
+        
+        According to copilot-instructions.md:
+        Ensure product ∏ p_i ≥ 2^{8b} for b-byte symbols
+        
+        Args:
+            primes: List of prime numbers
+            num_bytes: Number of bytes to encode
+            
+        Returns:
+            True if product is sufficient
+        """
+        # Compute product of primes
+        product = 1
+        for prime in primes:
+            product *= prime
+        
+        # Check if product ≥ 2^{8b}
+        # For 2-byte symbols (16 bits), need product ≥ 2^16 = 65536
+        required = 2 ** (8 * num_bytes)
+        
+        return product >= required
+    
     def _chinese_remainder_theorem(
         self,
         residues: List[tuple[int, int]]
