@@ -133,18 +133,18 @@ Conflict resolution via thermodynamic selection:
 - Track resonance score RS(t) = RS_★(1 - e^{-γt})
 - Select winner: min(S_stable) AND max(RS_stable)
 
-See [rec.md](rec.md) for detailed algorithm.
+See [rec.md](docs/rec.md) for detailed algorithm.
 
 ## Documentation
 
-- [Design Document](design.md) - Complete system architecture
-- [REC Algorithm](rec.md) - Resonant Eventual Consistency details
+- [Design Document](docs/design.md) - Complete system architecture
+- [REC Algorithm](docs/rec.md) - Resonant Eventual Consistency details
 - [Copilot Instructions](.github/copilot-instructions.md) - Implementation guidelines
-- [Phase 1 Summary](PHASE1_SUMMARY.md) - Foundation implementation
-- [Phase 2 Summary](PHASE2_SUMMARY.md) - Gossip plane implementation
-- [Phase 3 Summary](PHASE3_SUMMARY.md) - Resonance plane implementation
-- [Phase 4 Summary](PHASE4_SUMMARY.md) - REC conflict resolution implementation
-- [Phase 5 Summary](PHASE5_SUMMARY.md) - APIs and query language implementation
+- [Phase 1 Summary](docs/PHASE1_SUMMARY.md) - Foundation implementation
+- [Phase 2 Summary](docs/PHASE2_SUMMARY.md) - Gossip plane implementation
+- [Phase 3 Summary](docs/PHASE3_SUMMARY.md) - Resonance plane implementation
+- [Phase 4 Summary](docs/PHASE4_SUMMARY.md) - REC conflict resolution implementation
+- [Phase 5 Summary](docs/PHASE5_SUMMARY.md) - APIs and query language implementation
 
 ## Testing
 
