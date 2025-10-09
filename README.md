@@ -8,7 +8,6 @@
 [![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Tests](https://img.shields.io/badge/tests-220%20passing-brightgreen.svg)](#testing)
-[![Phase](https://img.shields.io/badge/phase-7.1%20complete-purple.svg)](#implementation-status)
 
 [Quick Start](#quick-start) • [Documentation](#documentation) • [Examples](examples/) • [Papers](papers/)
 
@@ -120,7 +119,7 @@ python -m pytest resonagraph/tests/ -v
 # With coverage
 python -m pytest resonagraph/tests/ --cov=resonagraph
 
-# Specific phase
+# Specific modules
 python -m pytest resonagraph/tests/test_gpu_acceleration.py -v
 ```
 
@@ -192,65 +191,6 @@ Conflict resolution via thermodynamic selection:
 1. Detect multiple epochs for same key
 2. Simulate dynamics to steady state for each candidate
 3. Select winner: **min(S_stable)** AND **max(RS_stable)**
-
-## Implementation Status
-
-### ✅ Phase 1: Foundation (Complete)
-- Prime selection (Eratosthenes sieve with hash seeding)
-- Phase encoding (golden ratio, HMAC binding)
-- Phase key management (HKDF derivation)
-- Client SDK structure
-- **14 tests passing**
-
-### ✅ Phase 2: Gossip Plane (Complete)
-- Beacon structure (128-512 bytes)
-- Kademlia DHT discovery
-- Bloom filters for deduplication
-- Gossip manager with periodic flooding
-- **59 tests passing**
-
-### ✅ Phase 3: Resonance Plane (Complete)
-- Probe synthesis and locking dynamics
-- Entropy tracking and convergence
-- Residue extraction
-- CRT reconstruction
-- **55 tests passing**
-
-### ✅ Phase 4: REC (Complete)
-- Conflict detection and candidate tracking
-- Thermodynamic simulation
-- Winner selection algorithm
-- Multi-epoch storage
-- **30 tests passing**
-
-### ✅ Phase 5: Query Language (Complete)
-- Cypher-inspired parser
-- `COHERE ON` for coherent subgraphs
-- `EPOCH WINDOW` for drift filtering
-- Graph traversal with Hamiltonian bias
-- **43 tests passing**
-
-### ✅ Phase 6: Security & Monitoring (Complete)
-- Access control with role-based policies
-- Audit logging with anonymization
-- Threat detection (brute force, enumeration, replay)
-- Alert management (email, webhooks, escalation)
-- Compliance reporting (GDPR, SOX, HIPAA, SOC2)
-- Log analytics and forensics
-- HSM integration
-- **15 tests passing**
-
-### ✅ Phase 7: Acceleration & Compression (Complete)
-- **GPU acceleration** for resonance locking (CuPy)
-  - 50-200x speedup on NVIDIA GPUs
-  - Automatic fallback to CPU
-- **LZ4 compression** with delta encoding
-  - 60-80% size reduction for beacons
-  - Configurable compression levels
-- **Performance benchmarks** and optimization
-- **4 tests passing**
-
-**Total: 220 tests passing**
 
 ## Security Features
 
@@ -381,15 +321,6 @@ options = {"k_primes": 64, "taper_alpha": 0.15, "r_min": 0.98}
 - **[Security Guidelines](docs/SECURITY.md)** - Security best practices
 - **[Threat Model](docs/THREAT_MODEL.md)** - Security analysis and mitigations
 
-### Implementation Phases
-- [Phase 1 Summary](docs/PHASE1_SUMMARY.md) - Foundation
-- [Phase 2 Summary](docs/PHASE2_SUMMARY.md) - Gossip Plane
-- [Phase 3 Summary](docs/PHASE3_SUMMARY.md) - Resonance Plane
-- [Phase 4 Summary](docs/PHASE4_SUMMARY.md) - REC
-- [Phase 5 Summary](docs/PHASE5_SUMMARY.md) - Query Language
-- [Phase 6D Summary](docs/PHASE6D_SUMMARY.md) - Security & Monitoring
-- [Phase 7.1 Summary](docs/PHASE7_1_SUMMARY.md) - GPU & Compression
-
 ### Research Papers
 See [`papers/`](papers/) directory for:
 - Prime-Resonant Graph Databases
@@ -401,14 +332,17 @@ See [`papers/`](papers/) directory for:
 ## Examples
 
 ```bash
-# Run foundation demo
-PYTHONPATH=. python examples/phase1_demo.py
+# Run basic demo
+PYTHONPATH=. python examples/basic_demo.py
 
 # Run GPU acceleration demo
-PYTHONPATH=. python examples/phase7_gpu_demo.py
+PYTHONPATH=. python examples/gpu_demo.py
 
 # Run security demo
-PYTHONPATH=. python examples/phase6_security_demo.py
+PYTHONPATH=. python examples/security_demo.py
+
+# Run compression demo
+PYTHONPATH=. python examples/compression_demo.py
 ```
 
 See [`examples/`](examples/) directory for more demonstrations.
