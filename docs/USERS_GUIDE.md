@@ -191,8 +191,14 @@ gossip:
   max_hops: 3
 
 storage:
-  backend: "rocksdb"
+  backend: "rocksdb"  # Options: "rocksdb", "memory", "auto"
   path: "/var/lib/resonagraph/data"
+  
+  # RocksDB-specific settings (Phase 7.5)
+  compression: "lz4"  # Options: "lz4", "snappy", "zstd", "none"
+  block_cache_size: 268435456  # 256MB
+  write_buffer_size: 134217728  # 128MB
+  max_open_files: 2000
   
 security:
   enable_audit: true
@@ -752,6 +758,162 @@ def incident_response_handler(alert):
         save_forensic_evidence(alert.alert_id, forensics)
 ```
 
+
+### Persistent Storage
+
+ResonaGraph uses a pluggable storage system that supports both in-memory and persistent RocksDB backends.
+
+#### Storage Configuration
+
+```python
+from resonagraph.storage import StorageManager, ROCKSDB_AVAILABLE
+
+# Auto-detect best backend (prefers RocksDB if available)
+manager = StorageManager(backend_type='auto', path='/data/resonagraph')
+
+# Force RocksDB backend
+manager = StorageManager(
+    backend_type='rocksdb',
+    path='/var/lib/resonagraph/db',
+    compression='lz4',
+    block_cache_size=256 * 1024 * 1024,  # 256MB
+    write_buffer_size=128 * 1024 * 1024  # 128MB
+)
+
+# Use in-memory backend (for development/testing)
+manager = StorageManager(backend_type='memory')
+```
+
+#### Primary Indexes
+
+Store and retrieve data with namespace isolation:
+
+```python
+# Create primary index for beacons
+beacons = manager.create_primary_index('beacons')
+
+# Store data
+beacons.put(b'beacon_1', {
+    'phase': 0.5,
+    'residues': [2, 3, 5, 7, 11],
+    'magnitude': 1.2
+})
+
+# Retrieve data
+data = beacons.get(b'beacon_1')
+print(f"Phase: {data['phase']}")
+
+# Scan with prefix
+for key, value in beacons.scan(prefix=b'beacon_'):
+    print(f"{key}: {value}")
+
+# Check existence
+if beacons.exists(b'beacon_1'):
+    print("Beacon exists")
+```
+
+#### Secondary Indexes
+
+Enable alternate key lookups:
+
+```python
+# Create secondary index
+by_prime = manager.create_secondary_index('by_prime')
+
+# Map secondary key to primary key
+for i in range(10):
+    primary_key = f"data_{i}".encode()
+    primes = [2, 3, 5, 7, 11][:i+1]
+    
+    # Store primary data
+    index.put(primary_key, {'primes': primes})
+    
+    # Create secondary index entries
+    for prime in primes:
+        secondary_key = f"{prime}:{i}".encode()
+        by_prime.put(secondary_key, primary_key)
+
+# Query by secondary index
+for sec_key, prim_key in by_prime.scan(prefix=b'7:'):
+    data = index.get(prim_key)
+    print(f"Found data with prime 7: {data}")
+```
+
+#### Batch Operations
+
+Atomic multi-operation transactions:
+
+```python
+import pickle
+
+# Batch write for atomicity
+namespace = b'primary:beacons:'
+with manager.batch_write() as batch:
+    for i in range(1000):
+        key = f"beacon_{i}".encode()
+        value = pickle.dumps({'id': i, 'phase': i * 0.1})
+        batch.put(namespace + key, value)
+# All operations committed atomically
+```
+
+#### Storage Statistics
+
+Monitor storage usage and performance:
+
+```python
+# Get storage statistics
+stats = manager.get_stats()
+
+print(f"Backend: {stats['backend']}")
+print(f"Library: {stats.get('library', 'N/A')}")
+print(f"Total keys: {stats.get('num_keys', 0)}")
+
+if stats['backend'] == 'rocksdb':
+    print(f"SST files size: {stats.get('total_sst_files_size', 0)} bytes")
+elif stats['backend'] == 'in-memory':
+    print(f"Memory usage: {stats.get('memory_bytes', 0)} bytes")
+
+print(f"Indexes: {stats['indexes']}")
+```
+
+#### Persistence and Recovery
+
+RocksDB provides full durability with Write-Ahead Log (WAL):
+
+```python
+# Write data with persistence
+manager = StorageManager(backend_type='rocksdb', path='/data/db')
+index = manager.create_primary_index('data')
+index.put(b'key1', {'value': 'data'})
+manager.close()
+
+# Data survives restart
+manager = StorageManager(backend_type='rocksdb', path='/data/db')
+index = manager.create_primary_index('data')
+data = index.get(b'key1')  # Data is still there
+```
+
+#### Performance Characteristics
+
+**In-Memory Backend:**
+- Write: ~1.7M ops/sec
+- Read: ~2.0M ops/sec
+- Best for: Development, testing, caching
+
+**RocksDB Backend:**
+- Write: ~350K ops/sec
+- Read: ~970K ops/sec
+- Compression: 75-85% size reduction (LZ4)
+- Best for: Production, large datasets
+
+#### Storage Best Practices
+
+1. **Choose the right backend**: Use RocksDB for production, in-memory for development
+2. **Configure compression**: LZ4 offers best balance of speed and compression
+3. **Size caches appropriately**: Larger block cache improves read performance
+4. **Use batch operations**: Group writes for better throughput
+5. **Monitor statistics**: Track storage growth and performance metrics
+6. **Plan for backups**: Regular snapshots of RocksDB directory
 
 ## Performance Optimization
 

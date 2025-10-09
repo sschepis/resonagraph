@@ -38,8 +38,9 @@ ResonaGraph implements a layered architecture based on the Prime-Resonant Graph 
 └─────────────────────────────────────────────────────────────┘
                                 ↕
 ┌─────────────────────────────────────────────────────────────┐
-│                   Storage Layer                            │
-│  • RocksDB • Encoded phases • Prime indices               │
+│                   Storage Layer (Phase 7.5)                │
+│  • RocksDB/In-Memory • Primary/Secondary Indexes          │
+│  • LZ4 Compression • Batch Operations • Statistics        │
 └─────────────────────────────────────────────────────────────┘
                                 ↕
 ┌─────────────────────────────────────────────────────────────┐
@@ -79,6 +80,14 @@ ResonaGraph implements a layered architecture based on the Prime-Resonant Graph 
 - **Locking**: Iterative overlap computation with entropy tracking
 - **Extraction**: Phase difference to modular residue conversion
 - **Reconstruction**: Chinese Remainder Theorem implementation
+
+#### Storage Layer (`resonagraph.storage`) - Phase 7.5
+- **Dual Backend Support**: RocksDB (rocksdict/python-rocksdb) and in-memory
+- **Index Structures**: Primary indexes (direct key-value) and secondary indexes (alternate keys)
+- **Batch Operations**: Atomic multi-operation transactions
+- **Compression**: LZ4, Snappy, ZSTD, None
+- **Statistics**: Backend-specific performance metrics
+- **Auto-fallback**: Graceful degradation to in-memory when RocksDB unavailable
 
 ### Data Flow
 
@@ -323,11 +332,11 @@ resonagraph/
 │   ├── probe.py               # Probe synthesis
 │   ├── rec.py                 # REC conflict resolution
 │   └── residue.py             # Residue extraction
-├── security/                   # Security and access control
-│   ├── access_control.py      # Policy-based access control
-│   ├── audit.py               # Audit logging
-│   ├── integrity.py           # Data integrity verification
-│   └── signatures.py          # Digital signatures
+├── storage/                    # Storage layer (Phase 7.5)
+│   ├── __init__.py            # Storage module exports
+│   ├── backend.py             # Storage backends (RocksDB, In-Memory)
+│   ├── index.py               # Primary and secondary indexes
+│   └── manager.py             # Unified storage manager
 ├── security/                   # Security and access control
 │   ├── access_control.py      # Policy-based access control
 │   ├── alert_manager.py       # Security alert management
@@ -492,24 +501,30 @@ gossip:
     expected_items: 100000          # Expected number of items
     false_positive_rate: 0.01       # Acceptable false positive rate
 
-# Storage configuration
+# Storage configuration (Phase 7.5)
 storage:
-  backend: "rocksdb"                # Storage backend
+  backend: "rocksdb"                # Options: "rocksdb", "memory", "auto"
   path: "/var/lib/resonagraph/data" # Data directory
   
-  # RocksDB-specific settings
+  # Compression and performance settings
+  compression: "lz4"                # Options: "lz4", "snappy", "zstd", "none"
+  block_cache_size: 268435456       # 256MB block cache
+  write_buffer_size: 134217728      # 128MB write buffer
+  max_open_files: 2000              # Maximum open file handles
+  
+  # Advanced RocksDB tuning (when backend="rocksdb")
   rocksdb:
-    max_open_files: 1000            # Maximum open file handles
-    write_buffer_size: 67108864     # Write buffer size (64MB)
     max_write_buffer_number: 3      # Number of write buffers
-    compression: "lz4"              # Compression algorithm
-    
-    # Performance tuning
     level0_file_num_compaction_trigger: 4
     level0_slowdown_writes_trigger: 20
     level0_stop_writes_trigger: 36
     max_background_compactions: 2
     max_background_flushes: 2
+    
+  # In-memory fallback (when RocksDB unavailable)
+  memory:
+    max_entries: 1000000            # Maximum entries before eviction
+    eviction_policy: "lru"          # Eviction policy
 
 # Resonance plane configuration
 resonance:
