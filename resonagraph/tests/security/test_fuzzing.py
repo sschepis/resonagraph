@@ -1,332 +1,507 @@
 """
-Security test suite for ResonaGraph.
+Fuzzing tests for ResonaGraph security components.
 
-Tests security hardening, fuzzing, and security regressions
-as specified in NEXT_STEPS.md 6.4.
+Tests system robustness against malformed inputs, edge cases,
+and adversarial inputs across all security components.
 """
 
-import os
-import random
 import pytest
+import secrets
+import random
+from typing import Any
 
-from resonagraph.security.hardening import SecurityHardening, InputValidator
-from resonagraph.security.signatures import SignatureKeyManager
-from resonagraph.security.integrity import PhaseMAC, ReplayDetector
-
-
-class TestSecurityHardening:
-    """Test security hardening utilities."""
-    
-    def test_constant_time_compare_equal(self):
-        """Test constant-time comparison with equal values."""
-        a = b"test_data_12345678"
-        b = b"test_data_12345678"
-        
-        assert SecurityHardening.constant_time_compare(a, b)
-    
-    def test_constant_time_compare_different(self):
-        """Test constant-time comparison with different values."""
-        a = b"test_data_12345678"
-        b = b"different_data_123"
-        
-        assert not SecurityHardening.constant_time_compare(a, b)
-    
-    def test_constant_time_compare_different_lengths(self):
-        """Test constant-time comparison with different lengths."""
-        a = b"short"
-        b = b"much_longer_string"
-        
-        assert not SecurityHardening.constant_time_compare(a, b)
-    
-    def test_secure_random_bytes(self):
-        """Test secure random byte generation."""
-        random1 = SecurityHardening.secure_random_bytes(32)
-        random2 = SecurityHardening.secure_random_bytes(32)
-        
-        assert len(random1) == 32
-        assert len(random2) == 32
-        assert random1 != random2  # Should be different
-    
-    def test_secure_random_int(self):
-        """Test secure random integer generation."""
-        for _ in range(100):
-            val = SecurityHardening.secure_random_int(1, 10)
-            assert 1 <= val <= 10
-    
-    def test_validate_key_size_valid(self):
-        """Test key size validation with valid key."""
-        key = b"a" * 32
-        SecurityHardening.validate_key_size(key, 32)  # Should not raise
-    
-    def test_validate_key_size_invalid(self):
-        """Test key size validation with invalid key."""
-        key = b"a" * 16
-        
-        with pytest.raises(ValueError, match="Invalid key size"):
-            SecurityHardening.validate_key_size(key, 32)
-    
-    def test_validate_signature_size_valid(self):
-        """Test signature size validation with valid signature."""
-        signature = b"a" * 64
-        SecurityHardening.validate_signature_size(signature)  # Should not raise
-    
-    def test_validate_signature_size_invalid(self):
-        """Test signature size validation with invalid signature."""
-        signature = b"a" * 32
-        
-        with pytest.raises(ValueError, match="Invalid signature size"):
-            SecurityHardening.validate_signature_size(signature)
-    
-    def test_sanitize_error_message(self):
-        """Test error message sanitization."""
-        internal = "Database error: user alice not found in table users"
-        safe = SecurityHardening.sanitize_error_message(internal)
-        
-        assert safe == "Operation failed"
-        assert "alice" not in safe
-    
-    def test_recommend_security_settings(self):
-        """Test security settings recommendations."""
-        settings = SecurityHardening.recommend_security_settings()
-        
-        assert settings['use_hsm'] is True
-        assert settings['key_rotation_interval'] == 86400
-        assert settings['audit_anonymization_level'] == 'HIGH'
+from resonagraph.security import (
+    PhaseKey,
+    KeyHierarchy,
+    SignatureKeyManager,
+    BeaconSigner,
+    PhaseMAC,
+    AuditLogger,
+    ThreatDetector,
+    AccessControl,
+    AccessPolicy,
+    AccessLevel
+)
+from resonagraph.security.hardening import (
+    ConstantTime,
+    MemorySafe,
+    InputValidation,
+    SecureCompare,
+    RateLimiter
+)
 
 
-class TestInputValidator:
-    """Test input validation utilities."""
+class FuzzGenerator:
+    """Generate fuzzing inputs for testing."""
     
-    def test_validate_key_format_valid(self):
-        """Test key format validation with valid key."""
-        InputValidator.validate_key_format("vertex:user_123")  # Should not raise
+    @staticmethod
+    def random_bytes(min_size: int = 0, max_size: int = 1024) -> bytes:
+        """Generate random bytes of random length."""
+        size = random.randint(min_size, max_size)
+        return secrets.token_bytes(size)
     
-    def test_validate_key_format_empty(self):
-        """Test key format validation with empty key."""
-        with pytest.raises(ValueError, match="cannot be empty"):
-            InputValidator.validate_key_format("")
+    @staticmethod
+    def malformed_bytes() -> list[bytes]:
+        """Generate collection of potentially malformed bytes."""
+        return [
+            b'',                          # Empty
+            b'\x00',                      # Null byte
+            b'\x00' * 1000,              # Many nulls
+            b'\xff' * 1000,              # Many 0xff
+            secrets.token_bytes(1),       # Too short
+            secrets.token_bytes(10000),   # Very long
+            b'A' * 32,                    # Repeated character
+            bytes(range(256)),            # All byte values
+        ]
     
-    def test_validate_key_format_too_long(self):
-        """Test key format validation with too long key."""
-        long_key = "a" * 2000
-        
-        with pytest.raises(ValueError, match="too long"):
-            InputValidator.validate_key_format(long_key)
+    @staticmethod
+    def malformed_integers() -> list[int]:
+        """Generate collection of potentially malformed integers."""
+        return [
+            -1,                           # Negative
+            0,                            # Zero
+            1,                            # One
+            2**31 - 1,                    # Max 32-bit
+            2**31,                        # Over 32-bit
+            2**63 - 1,                    # Max 64-bit
+            2**64,                        # Over 64-bit
+            -2**63,                       # Min 64-bit
+        ]
     
-    def test_validate_key_format_control_chars(self):
-        """Test key format validation rejects control characters."""
-        invalid_key = "test\x00key"
-        
-        with pytest.raises(ValueError, match="control characters"):
-            InputValidator.validate_key_format(invalid_key)
-    
-    def test_validate_epoch_valid(self):
-        """Test epoch validation with valid epoch."""
-        InputValidator.validate_epoch(95, 100, window=10)  # Should not raise
-    
-    def test_validate_epoch_too_old(self):
-        """Test epoch validation rejects too old epoch."""
-        with pytest.raises(ValueError, match="too old"):
-            InputValidator.validate_epoch(80, 100, window=10)
-    
-    def test_validate_epoch_too_future(self):
-        """Test epoch validation rejects far future epoch."""
-        with pytest.raises(ValueError, match="too far in future"):
-            InputValidator.validate_epoch(105, 100)
-    
-    def test_validate_epoch_negative(self):
-        """Test epoch validation rejects negative epoch."""
-        with pytest.raises(ValueError, match="cannot be negative"):
-            InputValidator.validate_epoch(-5, 100)
-    
-    def test_validate_nonce_valid(self):
-        """Test nonce validation with valid nonce."""
-        nonce = b"valid_nonce_12345678"
-        InputValidator.validate_nonce(nonce)  # Should not raise
-    
-    def test_validate_nonce_empty(self):
-        """Test nonce validation rejects empty nonce."""
-        with pytest.raises(ValueError, match="cannot be empty"):
-            InputValidator.validate_nonce(b"")
-    
-    def test_validate_nonce_too_short(self):
-        """Test nonce validation rejects too short nonce."""
-        with pytest.raises(ValueError, match="too short"):
-            InputValidator.validate_nonce(b"short")
-    
-    def test_validate_nonce_too_long(self):
-        """Test nonce validation rejects too long nonce."""
-        long_nonce = b"a" * 300
-        with pytest.raises(ValueError, match="too long"):
-            InputValidator.validate_nonce(long_nonce)
-    
-    def test_sanitize_resource_identifier(self):
-        """Test resource identifier sanitization."""
-        dangerous = "vertex:user_123'; DROP TABLE users--"
-        safe = InputValidator.sanitize_resource_identifier(dangerous)
-        
-        # Dangerous SQL characters should be removed
-        assert ";" not in safe
-        assert "'" not in safe
-        assert "--" not in safe
-        # Valid characters should remain
-        assert "vertex:" in safe
-        assert "user_123" in safe
+    @staticmethod
+    def malformed_strings() -> list[str]:
+        """Generate collection of potentially malformed strings."""
+        return [
+            '',                           # Empty
+            ' ',                          # Whitespace
+            '\x00',                       # Null character
+            '\n' * 100,                   # Many newlines
+            'A' * 10000,                  # Very long
+            '../../etc/passwd',           # Path traversal
+            '<script>alert(1)</script>',  # XSS
+            "'; DROP TABLE users;--",     # SQL injection
+            '\u0000\u0001\u001f',        # Control chars
+            '🔥' * 100,                   # Unicode
+        ]
 
 
-class TestSecurityFuzzing:
-    """Fuzzing tests for security-critical components."""
+class TestPhaseKeyFuzzing:
+    """Fuzzing tests for PhaseKey operations."""
     
-    def test_fuzz_signature_verification(self):
-        """Fuzz signature verification with random inputs."""
-        manager = SignatureKeyManager("test_node")
+    def test_from_secret_malformed(self):
+        """Test PhaseKey.from_secret with malformed inputs."""
+        for malformed in FuzzGenerator.malformed_bytes():
+            if len(malformed) != 32:
+                # Should reject invalid sizes
+                with pytest.raises((ValueError, TypeError)):
+                    PhaseKey.from_secret(malformed)
+            else:
+                # Should handle valid size
+                key = PhaseKey.from_secret(malformed)
+                assert isinstance(key, PhaseKey)
+    
+    def test_derive_with_malformed_context(self):
+        """Test key derivation with malformed context."""
+        root_key = PhaseKey.generate()
         
-        # Test with many random inputs
-        for _ in range(100):
-            # Random message and signature
-            message_len = random.randint(0, 1000)
-            message = os.urandom(message_len)
-            signature = os.urandom(64)
-            
-            # Should not crash, should return False for invalid
-            try:
-                result = manager.verify_signature(message, signature)
-                assert result is False  # Random signature should not verify
-            except Exception as e:
-                # Certain exceptions are acceptable (e.g., invalid format)
-                assert isinstance(e, (ValueError, TypeError))
-    
-    def test_fuzz_mac_verification(self):
-        """Fuzz MAC verification with random inputs."""
-        key = b"test_key_32_bytes_long_000000"
-        
-        for _ in range(100):
-            # Random chunk data
-            chunk_len = random.randint(0, 1000)
-            chunk_data = os.urandom(chunk_len)
-            chunk_index = random.randint(0, 100)
-            prime = random.randint(2, 1000)
-            mac = os.urandom(32)
-            
-            # Should not crash
-            try:
-                PhaseMAC.verify_chunk_mac(chunk_data, chunk_index, prime, mac, key)
-            except Exception:
-                pytest.fail("MAC verification crashed on random input")
-    
-    def test_fuzz_replay_detector(self):
-        """Fuzz replay detector with random inputs."""
-        detector = ReplayDetector()
-        
-        for _ in range(100):
-            # Random parameters
-            key = f"key_{random.randint(0, 100)}"
-            epoch = random.randint(-10, 200)
-            current_epoch = 100
-            nonce = os.urandom(random.randint(0, 100))
-            
-            # Should not crash
-            try:
-                detector.validate_beacon(key, epoch, current_epoch, nonce)
-            except Exception:
-                pytest.fail("Replay detector crashed on random input")
-    
-    def test_fuzz_input_validator(self):
-        """Fuzz input validator with malformed inputs."""
-        test_cases = [
-            "",
-            "\x00\x01\x02",
-            "a" * 10000,
-            "normal_key",
-            "key:with:many:colons",
-            "key\nwith\nnewlines",
-            "key\twith\ttabs",
-            "key with spaces",
-            "key_with_😀_emoji",
+        malformed_contexts = [
+            {},
+            {'': ''},
+            {'key': None},
+            {'key': 123},
+            {'key': b'bytes'},
+            {'very_long_key_' * 100: 'value'},
         ]
         
-        for test_input in test_cases:
-            # Should either accept or raise ValueError, not crash
+        for context in malformed_contexts:
+            # Should handle gracefully
             try:
-                InputValidator.validate_key_format(test_input)
-            except ValueError:
-                pass  # Expected for some inputs
-            except Exception as e:
-                pytest.fail(f"Unexpected exception: {e}")
+                derived = root_key.derive(context)
+                assert isinstance(derived, PhaseKey)
+            except (ValueError, TypeError):
+                # Acceptable to reject invalid context
+                pass
+    
+    def test_random_key_operations(self):
+        """Test random sequences of key operations."""
+        for _ in range(100):
+            key1 = PhaseKey.generate()
+            key2 = PhaseKey.generate()
+            
+            # Random operations should not crash
+            _ = key1 == key2
+            _ = hash(key1)
+            _ = key1.derive({'iteration': str(_)})
 
 
-class TestSecurityRegression:
-    """Regression tests for known security issues."""
+class TestSignatureFuzzing:
+    """Fuzzing tests for signature operations."""
     
-    def test_timing_attack_resistance(self):
-        """Test that key comparison is timing-resistant."""
-        import time
+    def test_sign_malformed_data(self):
+        """Test signing malformed data."""
+        signer = BeaconSigner()
         
-        key1 = b"a" * 32
-        key2 = b"a" * 31 + b"b"  # Different only in last byte
-        key3 = b"b" + b"a" * 31  # Different in first byte
-        
-        # Measure comparison times
-        iterations = 1000
-        
-        start = time.perf_counter()
-        for _ in range(iterations):
-            SecurityHardening.constant_time_compare(key1, key2)
-        time_last_diff = time.perf_counter() - start
-        
-        start = time.perf_counter()
-        for _ in range(iterations):
-            SecurityHardening.constant_time_compare(key1, key3)
-        time_first_diff = time.perf_counter() - start
-        
-        # Times should be similar (within 50% of each other)
-        # This is a weak test but catches obvious timing leaks
-        ratio = max(time_last_diff, time_first_diff) / min(time_last_diff, time_first_diff)
-        assert ratio < 1.5, "Potential timing attack vulnerability"
+        for malformed in FuzzGenerator.malformed_bytes():
+            # Should handle any bytes without crashing
+            signature = signer.sign_beacon(malformed)
+            assert isinstance(signature, bytes)
+            assert len(signature) == 64  # Ed25519 signature size
     
-    def test_key_not_logged(self):
-        """Test that keys are not exposed in string representations."""
-        from resonagraph.core.phase_key import PhaseKey
-        
-        key = PhaseKey.generate()
-        key_repr = repr(key)
-        key_str = str(key)
-        
-        # Should not contain actual key bytes
-        assert "***hidden***" in key_repr
-        assert len(key.get_bytes()) == 32
-        # Make sure actual key bytes aren't in the representation
-        key_hex = key.get_bytes().hex()
-        assert key_hex not in key_repr
-    
-    def test_signature_verification_constant_time(self):
-        """Test that signature verification doesn't leak info via timing."""
-        manager = SignatureKeyManager("node1")
-        
+    def test_verify_malformed_signatures(self):
+        """Test verifying malformed signatures."""
+        signer = BeaconSigner()
         message = b"test message"
-        signing_key = manager.get_signing_key()
-        valid_signature = signing_key.sign(message)
+        valid_sig = signer.sign_beacon(message)
         
-        # Invalid signature (all zeros)
-        invalid_signature1 = b'\x00' * 64
+        for malformed in FuzzGenerator.malformed_bytes():
+            # Should reject invalid signatures
+            result = signer.verify_beacon(message, malformed)
+            if malformed == valid_sig:
+                assert result is True
+            else:
+                assert result is False
+    
+    def test_signature_length_attacks(self):
+        """Test signature verification with length attacks."""
+        signer = BeaconSigner()
+        message = b"test message"
+        valid_sig = signer.sign_beacon(message)
         
-        # Invalid signature (random)
-        invalid_signature2 = os.urandom(64)
+        # Try various signature lengths
+        for length in [0, 1, 63, 64, 65, 100, 1000]:
+            if length == 64:
+                continue  # Skip valid length
+            
+            malformed = secrets.token_bytes(length)
+            result = signer.verify_beacon(message, malformed)
+            assert result is False
+    
+    def test_concurrent_signing(self):
+        """Test concurrent signing operations."""
+        signer = BeaconSigner()
+        
+        # Multiple signatures should be independent
+        messages = [secrets.token_bytes(32) for _ in range(100)]
+        signatures = [signer.sign_beacon(msg) for msg in messages]
+        
+        # All signatures should verify
+        for msg, sig in zip(messages, signatures):
+            assert signer.verify_beacon(msg, sig)
+        
+        # Cross-verification should fail
+        for i, msg in enumerate(messages):
+            wrong_sig = signatures[(i + 1) % len(signatures)]
+            assert not signer.verify_beacon(msg, wrong_sig)
+
+
+class TestMACFuzzing:
+    """Fuzzing tests for MAC operations."""
+    
+    def test_compute_mac_malformed(self):
+        """Test MAC computation with malformed inputs."""
+        phase_key = PhaseKey.generate()
+        mac = PhaseMAC(phase_key)
+        
+        for chunk_idx in FuzzGenerator.malformed_integers():
+            for prime in FuzzGenerator.malformed_integers():
+                for data in FuzzGenerator.malformed_bytes():
+                    try:
+                        result = mac.compute_chunk_mac(chunk_idx, prime, data)
+                        assert isinstance(result, bytes)
+                    except (ValueError, TypeError, OverflowError):
+                        # Acceptable to reject invalid inputs
+                        pass
+    
+    def test_verify_mac_random(self):
+        """Test MAC verification with random inputs."""
+        phase_key = PhaseKey.generate()
+        mac = PhaseMAC(phase_key)
+        
+        # Generate valid MAC
+        chunk_idx = 0
+        prime = 2
+        data = b"test data"
+        valid_mac = mac.compute_chunk_mac(chunk_idx, prime, data)
+        
+        # Try random MACs (should all fail except valid one)
+        for _ in range(100):
+            random_mac = secrets.token_bytes(32)
+            result = mac.verify_chunk_mac(chunk_idx, prime, data, random_mac)
+            
+            if random_mac == valid_mac:
+                assert result is True
+            else:
+                assert result is False
+
+
+class TestInputValidationFuzzing:
+    """Fuzzing tests for input validation."""
+    
+    def test_validate_key_size_fuzzing(self):
+        """Test key size validation with random inputs."""
+        for size in FuzzGenerator.malformed_integers():
+            if size < 0:
+                continue  # Skip negative sizes
+            
+            key = secrets.token_bytes(size) if size <= 10000 else b'x' * size
+            
+            try:
+                InputValidation.validate_key_size(key, 32)
+                assert len(key) == 32
+            except ValueError:
+                assert len(key) != 32
+    
+    def test_sanitize_string_fuzzing(self):
+        """Test string sanitization with malformed inputs."""
+        for malformed in FuzzGenerator.malformed_strings():
+            try:
+                result = InputValidation.sanitize_string(malformed)
+                assert isinstance(result, str)
+                # No null bytes
+                assert '\x00' not in result
+                # Within max length
+                assert len(result) <= 1024
+            except (ValueError, TypeError):
+                # Acceptable to reject some inputs
+                pass
+    
+    def test_validate_integer_range_fuzzing(self):
+        """Test integer range validation."""
+        for value in FuzzGenerator.malformed_integers():
+            # Various ranges
+            ranges = [
+                (0, 100),
+                (-100, 100),
+                (0, 2**32),
+                (None, 1000),
+                (0, None),
+            ]
+            
+            for min_val, max_val in ranges:
+                try:
+                    InputValidation.validate_integer_range(
+                        value, min_val, max_val
+                    )
+                    # If successful, value must be in range
+                    if min_val is not None:
+                        assert value >= min_val
+                    if max_val is not None:
+                        assert value <= max_val
+                except (ValueError, TypeError):
+                    # Acceptable to reject out-of-range
+                    pass
+
+
+class TestConstantTimeFuzzing:
+    """Fuzzing tests for constant-time operations."""
+    
+    def test_compare_random_bytes(self):
+        """Test constant-time compare with random inputs."""
+        for _ in range(100):
+            a = FuzzGenerator.random_bytes()
+            b = FuzzGenerator.random_bytes()
+            
+            result = ConstantTime.compare(a, b)
+            assert isinstance(result, bool)
+            assert result == (a == b)
+    
+    def test_compare_timing_consistency(self):
+        """Test that comparison time is independent of input."""
+        import time
+        
+        # Generate test cases
+        equal_pairs = [(b'A' * 32, b'A' * 32) for _ in range(100)]
+        diff_early = [(b'A' * 32, b'B' + b'A' * 31) for _ in range(100)]
+        diff_late = [(b'A' * 31 + b'B', b'A' * 32) for _ in range(100)]
+        
+        def measure_timing(pairs):
+            start = time.perf_counter()
+            for a, b in pairs:
+                ConstantTime.compare(a, b)
+            return time.perf_counter() - start
+        
+        # All should take similar time
+        t_equal = measure_timing(equal_pairs)
+        t_early = measure_timing(diff_early)
+        t_late = measure_timing(diff_late)
+        
+        # Timing should not vary significantly
+        avg = (t_equal + t_early + t_late) / 3
+        assert abs(t_equal - avg) / avg < 0.5  # Within 50%
+        assert abs(t_early - avg) / avg < 0.5
+        assert abs(t_late - avg) / avg < 0.5
+
+
+class TestRateLimiterFuzzing:
+    """Fuzzing tests for rate limiter."""
+    
+    def test_rate_limiter_random_requests(self):
+        """Test rate limiter with random request patterns."""
+        limiter = RateLimiter(max_attempts=10, window_seconds=1)
+        
+        # Random identifiers
+        identifiers = [f"user_{i}" for i in range(20)]
+        
+        # Random requests
+        for _ in range(200):
+            identifier = random.choice(identifiers)
+            result = limiter.check_limit(identifier)
+            assert isinstance(result, bool)
+    
+    def test_rate_limiter_burst(self):
+        """Test rate limiter under burst conditions."""
+        limiter = RateLimiter(max_attempts=5, window_seconds=1)
+        
+        identifier = "test_user"
+        
+        # Burst of requests
+        results = [limiter.check_limit(identifier) for _ in range(20)]
+        
+        # First 5 should succeed, rest should fail
+        assert sum(results) <= 5
+        assert results[:5] == [True] * 5
+        assert all(not r for r in results[5:])
+
+
+class TestAccessControlFuzzing:
+    """Fuzzing tests for access control."""
+    
+    def test_policy_with_malformed_resources(self):
+        """Test access control with malformed resource patterns."""
+        root_key = PhaseKey.generate()
+        hierarchy = KeyHierarchy(root_key)
+        ac = AccessControl(hierarchy)
+        
+        malformed_resources = [
+            '',
+            '*' * 1000,
+            '/' * 100,
+            '../../../etc/passwd',
+            'vertex:' + 'A' * 10000,
+        ]
+        
+        for resource in malformed_resources:
+            try:
+                policy = AccessPolicy(
+                    resource=resource,
+                    action="read",
+                    principal="user",
+                    level=AccessLevel.READ_ONLY
+                )
+                ac.add_policy(policy)
+            except (ValueError, TypeError):
+                # Acceptable to reject malformed resources
+                pass
+    
+    def test_concurrent_policy_checks(self):
+        """Test concurrent access policy checks."""
+        root_key = PhaseKey.generate()
+        hierarchy = KeyHierarchy(root_key)
+        ac = AccessControl(hierarchy)
+        
+        # Add policies
+        ac.add_policy(AccessPolicy(
+            resource="vertex:*",
+            action="read",
+            principal="role:user",
+            level=AccessLevel.READ_ONLY
+        ))
+        
+        # Many concurrent checks
+        for _ in range(1000):
+            resource = f"vertex:user_{random.randint(0, 100)}"
+            action = random.choice(["read", "write", "delete"])
+            principal = f"role:{random.choice(['user', 'admin', 'guest'])}"
+            
+            result = ac.check_access(resource, action, principal)
+            assert isinstance(result, bool)
+
+
+class TestAuditLogFuzzing:
+    """Fuzzing tests for audit logging."""
+    
+    def test_log_malformed_events(self, tmp_path):
+        """Test logging malformed audit events."""
+        log_file = tmp_path / "audit_fuzz.log"
+        logger = AuditLogger(str(log_file))
+        
+        malformed_events = [
+            {},  # Empty event
+            {'event_type': None},
+            {'event_type': ''},
+            {'event_type': 'test', 'actor': None},
+            {'event_type': 'test', 'resource': '../../../etc/passwd'},
+            {'event_type': 'test' * 1000},  # Very long
+        ]
+        
+        for event in malformed_events:
+            try:
+                logger.log_event(**event)
+            except (ValueError, TypeError, KeyError):
+                # Acceptable to reject invalid events
+                pass
+    
+    def test_concurrent_logging(self, tmp_path):
+        """Test concurrent audit logging."""
+        log_file = tmp_path / "audit_concurrent.log"
+        logger = AuditLogger(str(log_file))
+        
+        # Log many events concurrently
+        for i in range(1000):
+            logger.log_event(
+                event_type=random.choice(['read', 'write', 'delete']),
+                actor=f"user_{random.randint(0, 100)}",
+                resource=f"resource_{random.randint(0, 100)}",
+                action=random.choice(['get', 'put', 'delete']),
+                outcome=random.choice(['success', 'failure'])
+            )
+        
+        # Verify log integrity
+        logger.verify_integrity()
+
+
+# Performance and stress tests
+class TestSecurityPerformance:
+    """Performance tests for security operations."""
+    
+    def test_signature_performance(self):
+        """Test signature generation/verification performance."""
+        signer = BeaconSigner()
+        message = secrets.token_bytes(1024)
         
         import time
-        iterations = 100
         
-        # Time invalid signatures
+        # Benchmark signing
         start = time.perf_counter()
-        for _ in range(iterations):
-            manager.verify_signature(message, invalid_signature1)
-        time_zeros = time.perf_counter() - start
+        signatures = [signer.sign_beacon(message) for _ in range(100)]
+        sign_time = time.perf_counter() - start
         
+        # Benchmark verification
         start = time.perf_counter()
-        for _ in range(iterations):
-            manager.verify_signature(message, invalid_signature2)
-        time_random = time.perf_counter() - start
+        for sig in signatures:
+            signer.verify_beacon(message, sig)
+        verify_time = time.perf_counter() - start
         
-        # Times should be similar
-        ratio = max(time_zeros, time_random) / min(time_zeros, time_random)
-        assert ratio < 2.0, "Potential timing leak in signature verification"
+        # Should be reasonably fast
+        assert sign_time < 1.0  # 100 signatures in < 1s
+        assert verify_time < 1.0  # 100 verifications in < 1s
+    
+    def test_mac_performance(self):
+        """Test MAC computation performance."""
+        phase_key = PhaseKey.generate()
+        mac = PhaseMAC(phase_key)
+        
+        import time
+        
+        # Benchmark MAC computation
+        start = time.perf_counter()
+        for i in range(1000):
+            mac.compute_chunk_mac(i, 2, b"test data")
+        compute_time = time.perf_counter() - start
+        
+        # Should handle 1000 MACs quickly
+        assert compute_time < 1.0
+
+
+if __name__ == '__main__':
+    pytest.main([__file__, '-v'])

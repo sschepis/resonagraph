@@ -1,403 +1,558 @@
 """
-Audit logging for security events.
+Audit logging for ResonaGraph security events.
 
-According to NEXT_STEPS.md 6.3:
-- Structured logging (JSON format)
-- Asynchronous logging for performance
-- Log rotation and retention policies
-- Tamper-evident logging (hash chain)
-- Track lock attempts, access denials, key operations
+Provides tamper-evident logging with anonymization for compliance
+(GDPR, HIPAA, SOC2).
 """
 
 import json
-import hashlib
 import time
+import hashlib
+import hmac
+import os
 import threading
-from typing import Dict, Any, Optional, List
-from dataclasses import dataclass, field, asdict
+from datetime import datetime
+from typing import Dict, Any, Optional, List, Tuple, Union, TextIO
+from dataclasses import dataclass, asdict
 from enum import Enum
-from pathlib import Path
 import logging
 from logging.handlers import RotatingFileHandler
 
 
+class AnonymizationLevel(Enum):
+    """Levels of anonymization for audit logs."""
+    NONE = "none"        # No anonymization (dev only)
+    LOW = "low"          # Hash PIDs and user IDs
+    MEDIUM = "medium"    # Hash all identifiers
+    HIGH = "high"        # Hash all identifiers + truncate data
+
+
 class AuditEventType(Enum):
     """Types of audit events."""
-    LOCK_ATTEMPT = "lock_attempt"
-    LOCK_SUCCESS = "lock_success"
-    LOCK_FAILURE = "lock_failure"
-    ACCESS_DENIED = "access_denied"
+    # Authentication events
+    LOGIN_SUCCESS = "login_success"
+    LOGIN_FAILED = "login_failed"
+    LOGOUT = "logout"
+    
+    # Authorization events
     ACCESS_GRANTED = "access_granted"
-    KEY_GENERATED = "key_generated"
+    ACCESS_DENIED = "access_denied"
+    PERMISSION_CHANGED = "permission_changed"
+    
+    # Key management events
+    KEY_CREATED = "key_created"
     KEY_ROTATED = "key_rotated"
     KEY_REVOKED = "key_revoked"
-    KEY_DERIVED = "key_derived"
-    SIGNATURE_VERIFIED = "signature_verified"
+    KEY_ACCESSED = "key_accessed"
+    
+    # Data access events
+    DATA_READ = "data_read"
+    DATA_WRITE = "data_write"
+    DATA_DELETE = "data_delete"
+    
+    # Resonance events
+    LOCK_ATTEMPT = "lock_attempt"
+    LOCK_SUCCESS = "lock_success"
+    LOCK_FAILED = "lock_failed"
+    BEACON_VERIFIED = "beacon_verified"
     SIGNATURE_FAILED = "signature_failed"
-    MAC_VERIFIED = "mac_verified"
-    MAC_FAILED = "mac_failed"
+    
+    # Security events
     REPLAY_DETECTED = "replay_detected"
-    POLICY_VIOLATION = "policy_violation"
-    HSM_OPERATION = "hsm_operation"
+    INTEGRITY_VIOLATION = "integrity_violation"
+    SUSPICIOUS_ACTIVITY = "suspicious_activity"
+    
+    # System events
+    SERVICE_STARTED = "service_started"
+    SERVICE_STOPPED = "service_stopped"
+    CONFIGURATION_CHANGED = "configuration_changed"
+    ERROR_OCCURRED = "error_occurred"
 
 
 @dataclass
 class AuditEvent:
-    """
-    Represents an audit log event.
-    
-    According to NEXT_STEPS.md 6.3:
-    - Event type (lock_attempt, access_denied, key_rotation, etc.)
-    - Timestamp, actor (anonymized fingerprint), resource
-    - Action, outcome, metadata
-    """
-    event_type: AuditEventType
+    """Represents a single audit event."""
+    event_type: str
     timestamp: float
-    actor: str  # Anonymized fingerprint
     resource: str
     action: str
-    outcome: str  # success, failure, denied
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    outcome: str  # success, failure, error
+    actor: Optional[str] = None
+    actor_ip: Optional[str] = None
+    session_id: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
     
-    # For hash chain (tamper-evident logging)
-    previous_hash: Optional[str] = None
-    event_hash: Optional[str] = None
-    
-    def compute_hash(self) -> str:
-        """
-        Compute hash of this event for tamper-evident logging.
+    def __post_init__(self):
+        """Validate event data."""
+        if self.timestamp is None:
+            self.timestamp = time.time()
         
-        Returns:
-            SHA-256 hash of event data
-        """
-        # Create deterministic representation
-        event_data = {
-            'event_type': self.event_type.value,
-            'timestamp': self.timestamp,
-            'actor': self.actor,
-            'resource': self.resource,
-            'action': self.action,
-            'outcome': self.outcome,
-            'metadata': self.metadata,
-            'previous_hash': self.previous_hash or ''
-        }
-        
-        # Sort keys for deterministic ordering
-        json_str = json.dumps(event_data, sort_keys=True)
-        return hashlib.sha256(json_str.encode('utf-8')).hexdigest()
+        if self.metadata is None:
+            self.metadata = {}
     
     def to_dict(self) -> Dict[str, Any]:
-        """Convert event to dictionary."""
-        data = asdict(self)
-        data['event_type'] = self.event_type.value
-        return data
+        """Convert to dictionary for serialization."""
+        return asdict(self)
     
-    def to_json(self) -> str:
-        """Convert event to JSON string."""
-        return json.dumps(self.to_dict(), sort_keys=True)
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'AuditEvent':
+        """Create from dictionary."""
+        return cls(**data)
+
+
+class Anonymizer:
+    """Handles anonymization of audit data."""
+    
+    def __init__(self, level: AnonymizationLevel, salt: Optional[bytes] = None):
+        """
+        Initialize anonymizer.
+        
+        Args:
+            level: Anonymization level
+            salt: Salt for hashing (generated if None)
+        """
+        self.level = level
+        self.salt = salt or os.urandom(32)
+        self._hash_cache: Dict[str, str] = {}
+    
+    def anonymize_event(self, event: AuditEvent) -> AuditEvent:
+        """
+        Anonymize an audit event based on configured level.
+        
+        Args:
+            event: Original audit event
+            
+        Returns:
+            Anonymized audit event
+        """
+        if self.level == AnonymizationLevel.NONE:
+            return event
+        
+        # Create copy to avoid modifying original
+        anonymized = AuditEvent(
+            event_type=event.event_type,
+            timestamp=event.timestamp,
+            resource=self._anonymize_identifier(event.resource),
+            action=event.action,
+            outcome=event.outcome,
+            actor=self._anonymize_identifier(event.actor) if event.actor else None,
+            actor_ip=self._anonymize_ip(event.actor_ip) if event.actor_ip else None,
+            session_id=self._anonymize_identifier(event.session_id) if event.session_id else None,
+            metadata=self._anonymize_metadata(event.metadata or {})
+        )
+        
+        return anonymized
+    
+    def _anonymize_identifier(self, identifier: Optional[str]) -> Optional[str]:
+        """Anonymize an identifier."""
+        if not identifier:
+            return identifier
+        
+        if identifier in self._hash_cache:
+            return self._hash_cache[identifier]
+        
+        # Hash the identifier with salt
+        hash_input = f"{identifier}:{self.salt.hex()}".encode()
+        hash_value = hashlib.sha256(hash_input).hexdigest()
+        
+        if self.level == AnonymizationLevel.HIGH:
+            # Truncate hash for higher anonymization
+            hash_value = hash_value[:16]
+        
+        self._hash_cache[identifier] = hash_value
+        return hash_value
+    
+    def _anonymize_ip(self, ip_address: Optional[str]) -> Optional[str]:
+        """Anonymize IP address."""
+        if not ip_address:
+            return ip_address
+        
+        if self.level in [AnonymizationLevel.LOW, AnonymizationLevel.MEDIUM]:
+            # Zero out last octet for IPv4
+            if '.' in ip_address:
+                parts = ip_address.split('.')
+                if len(parts) == 4:
+                    return f"{parts[0]}.{parts[1]}.{parts[2]}.0"
+        
+        # Full anonymization
+        return self._anonymize_identifier(ip_address)
+    
+    def _anonymize_metadata(self, metadata: Dict[str, Any]) -> Dict[str, Any]:
+        """Anonymize metadata fields."""
+        if self.level == AnonymizationLevel.NONE:
+            return metadata
+        
+        anonymized = {}
+        sensitive_keys = {
+            'user_id', 'username', 'email', 'phone', 'ssn', 'key_id',
+            'phase_key', 'signature', 'token', 'password', 'secret'
+        }
+        
+        for key, value in metadata.items():
+            if key.lower() in sensitive_keys:
+                if isinstance(value, str):
+                    anonymized[key] = self._anonymize_identifier(value)
+                else:
+                    anonymized[key] = "[REDACTED]"
+            elif self.level == AnonymizationLevel.HIGH and isinstance(value, str) and len(value) > 50:
+                # Truncate long strings in high anonymization
+                anonymized[key] = value[:50] + "..."
+            else:
+                anonymized[key] = value
+        
+        return anonymized
+
+
+class HashChain:
+    """Implements tamper-evident hash chain for audit logs."""
+    
+    def __init__(self, chain_key: bytes):
+        """
+        Initialize hash chain.
+        
+        Args:
+            chain_key: Secret key for hash chain
+        """
+        self.chain_key = chain_key
+        self.previous_hash = b'\x00' * 32  # Genesis hash
+    
+    def add_event(self, event_data: bytes) -> str:
+        """
+        Add event to hash chain.
+        
+        Args:
+            event_data: Serialized event data
+            
+        Returns:
+            Hash value for this event
+        """
+        # Compute HMAC of previous hash + event data
+        combined = self.previous_hash + event_data
+        current_hash = hmac.new(self.chain_key, combined, hashlib.sha256).digest()
+        
+        # Update chain state
+        self.previous_hash = current_hash
+        
+        return current_hash.hex()
+    
+    def verify_chain(self, events: List[Tuple[bytes, str]]) -> bool:
+        """
+        Verify integrity of event chain.
+        
+        Args:
+            events: List of (event_data, expected_hash) tuples
+            
+        Returns:
+            True if chain is valid
+        """
+        previous_hash = b'\x00' * 32
+        
+        for event_data, expected_hash in events:
+            combined = previous_hash + event_data
+            computed_hash = hmac.new(self.chain_key, combined, hashlib.sha256).digest()
+            
+            if computed_hash.hex() != expected_hash:
+                return False
+            
+            previous_hash = computed_hash
+        
+        return True
 
 
 class AuditLogger:
     """
-    Manages audit logging with tamper-evident hash chain.
-    
-    According to NEXT_STEPS.md 6.3:
-    - Structured logging (JSON format)
-    - Asynchronous logging for performance
-    - Log rotation and retention policies
-    - Tamper-evident logging (hash chain)
+    Main audit logger with rotation and tamper-evident logging.
     """
     
     def __init__(
         self,
-        log_file: str = "audit.log",
-        max_bytes: int = 10 * 1024 * 1024,  # 10 MB
+        log_file: str,
+        anonymizer: Optional[Anonymizer] = None,
+        enable_hash_chain: bool = True,
+        max_bytes: int = 10 * 1024 * 1024,  # 10MB
         backup_count: int = 10,
-        enable_hash_chain: bool = True
+        chain_key: Optional[bytes] = None
     ):
         """
         Initialize audit logger.
         
         Args:
             log_file: Path to audit log file
+            anonymizer: Anonymizer for sensitive data
+            enable_hash_chain: Enable tamper-evident hash chain
             max_bytes: Maximum log file size before rotation
             backup_count: Number of backup files to keep
-            enable_hash_chain: Enable tamper-evident hash chain
+            chain_key: Key for hash chain (generated if None)
         """
+        self.log_file = log_file
+        self.anonymizer = anonymizer or Anonymizer(AnonymizationLevel.MEDIUM)
         self.enable_hash_chain = enable_hash_chain
-        self._last_hash: Optional[str] = None
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         
-        # Create log directory if needed
-        log_path = Path(log_file)
-        log_path.parent.mkdir(parents=True, exist_ok=True)
+        # Set up file handler with rotation
+        os.makedirs(os.path.dirname(log_file), exist_ok=True)
         
-        # Set up rotating file handler
-        self.logger = logging.getLogger('resonagraph.audit')
+        self.logger = logging.getLogger(f"resonagraph.audit.{id(self)}")
         self.logger.setLevel(logging.INFO)
-        self.logger.propagate = False  # Don't propagate to root logger
         
         # Remove existing handlers
-        self.logger.handlers.clear()
+        for handler in self.logger.handlers[:]:
+            self.logger.removeHandler(handler)
         
         # Add rotating file handler
         handler = RotatingFileHandler(
             log_file,
             maxBytes=max_bytes,
-            backupCount=backup_count
+            backupCount=backup_count,
+            encoding='utf-8'
         )
-        handler.setFormatter(logging.Formatter('%(message)s'))
+        
+        # Use JSON formatter
+        formatter = logging.Formatter('%(message)s')
+        handler.setFormatter(formatter)
         self.logger.addHandler(handler)
+        
+        # Initialize hash chain
+        self.hash_chain = None
+        if enable_hash_chain:
+            if chain_key is None:
+                chain_key = os.urandom(32)
+            self.hash_chain = HashChain(chain_key)
+        
+        # Track statistics
+        self.stats = {
+            'events_logged': 0,
+            'events_anonymized': 0,
+            'chain_violations': 0,
+            'last_event_time': None
+        }
     
-    def log_event(
-        self,
-        event_type: AuditEventType,
-        actor: str,
-        resource: str,
-        action: str,
-        outcome: str,
-        metadata: Optional[Dict[str, Any]] = None
-    ) -> AuditEvent:
+    def log_event(self, event: AuditEvent) -> None:
         """
         Log an audit event.
         
         Args:
-            event_type: Type of event
-            actor: Actor (anonymized fingerprint)
-            resource: Resource being accessed
-            action: Action being performed
-            outcome: Outcome (success, failure, denied)
-            metadata: Optional additional metadata
-            
-        Returns:
-            Created audit event
+            event: Audit event to log
         """
         with self._lock:
-            event = AuditEvent(
-                event_type=event_type,
-                timestamp=time.time(),
-                actor=actor,
-                resource=resource,
-                action=action,
-                outcome=outcome,
-                metadata=metadata or {},
-                previous_hash=self._last_hash if self.enable_hash_chain else None
-            )
-            
-            # Compute hash for hash chain
-            if self.enable_hash_chain:
-                event.event_hash = event.compute_hash()
-                self._last_hash = event.event_hash
-            
-            # Write to log
-            self.logger.info(event.to_json())
-            
-            return event
+            try:
+                # Anonymize event if configured
+                log_event = event
+                if self.anonymizer.level != AnonymizationLevel.NONE:
+                    log_event = self.anonymizer.anonymize_event(event)
+                    self.stats['events_anonymized'] += 1
+                
+                # Convert to JSON
+                event_dict = log_event.to_dict()
+                
+                # Add hash chain if enabled
+                if self.hash_chain:
+                    event_data = json.dumps(event_dict, sort_keys=True).encode()
+                    event_dict['chain_hash'] = self.hash_chain.add_event(event_data)
+                
+                # Add metadata
+                event_dict['log_timestamp'] = time.time()
+                event_dict['logger_id'] = id(self)
+                
+                # Log the event
+                self.logger.info(json.dumps(event_dict, sort_keys=True))
+                
+                # Update statistics
+                self.stats['events_logged'] += 1
+                self.stats['last_event_time'] = event_dict['log_timestamp']
+                
+            except Exception as e:
+                # Log error to standard logger
+                error_logger = logging.getLogger('resonagraph.audit.error')
+                error_logger.error(f"Failed to log audit event: {e}")
     
-    def log_lock_attempt(
+    def log_security_event(
         self,
-        actor: str,
-        key: str,
-        success: bool,
-        convergence_metrics: Optional[Dict[str, Any]] = None
-    ) -> AuditEvent:
-        """
-        Log a resonance lock attempt.
-        
-        Args:
-            actor: Actor fingerprint
-            key: Key being locked
-            success: Whether lock succeeded
-            convergence_metrics: Optional convergence metrics
-            
-        Returns:
-            Audit event
-        """
-        return self.log_event(
-            event_type=AuditEventType.LOCK_SUCCESS if success else AuditEventType.LOCK_FAILURE,
-            actor=actor,
-            resource=key,
-            action="lock",
-            outcome="success" if success else "failure",
-            metadata=convergence_metrics or {}
-        )
-    
-    def log_access_decision(
-        self,
-        actor: str,
+        event_type: AuditEventType,
         resource: str,
-        action: str,
-        granted: bool,
-        reason: Optional[str] = None
-    ) -> AuditEvent:
+        outcome: str,
+        actor: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> None:
         """
-        Log an access control decision.
+        Convenience method for logging security events.
         
         Args:
-            actor: Actor (role:name or user:name)
+            event_type: Type of security event
             resource: Resource being accessed
-            action: Action being performed
-            granted: Whether access was granted
-            reason: Optional reason for decision
-            
-        Returns:
-            Audit event
+            outcome: Outcome (success, failure, error)
+            actor: Actor performing the action
+            metadata: Additional event metadata
         """
-        return self.log_event(
-            event_type=AuditEventType.ACCESS_GRANTED if granted else AuditEventType.ACCESS_DENIED,
-            actor=actor,
+        event = AuditEvent(
+            event_type=event_type.value,
+            timestamp=time.time(),
             resource=resource,
-            action=action,
-            outcome="granted" if granted else "denied",
-            metadata={'reason': reason} if reason else {}
+            action="security_event",
+            outcome=outcome,
+            actor=actor,
+            metadata=metadata or {}
         )
+        self.log_event(event)
     
     def log_key_operation(
         self,
         operation: str,
         key_id: str,
-        key_type: str,
-        actor: str = "system",
+        outcome: str,
+        actor: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None
-    ) -> AuditEvent:
+    ) -> None:
         """
-        Log a key operation.
+        Convenience method for logging key operations.
         
         Args:
-            operation: Operation (generate, rotate, revoke, derive)
+            operation: Key operation (create, rotate, revoke, access)
             key_id: Key identifier
-            key_type: Key type (root, topic, role, signature)
+            outcome: Outcome of operation
             actor: Actor performing operation
-            metadata: Optional additional metadata
-            
-        Returns:
-            Audit event
+            metadata: Additional metadata
         """
-        event_type_map = {
-            'generate': AuditEventType.KEY_GENERATED,
-            'rotate': AuditEventType.KEY_ROTATED,
-            'revoke': AuditEventType.KEY_REVOKED,
-            'derive': AuditEventType.KEY_DERIVED,
-        }
-        
-        return self.log_event(
-            event_type=event_type_map.get(operation, AuditEventType.KEY_GENERATED),
-            actor=actor,
+        event = AuditEvent(
+            event_type=f"key_{operation}",
+            timestamp=time.time(),
             resource=key_id,
-            action=operation,
-            outcome="success",
-            metadata={'key_type': key_type, **(metadata or {})}
-        )
-    
-    def log_signature_verification(
-        self,
-        key_id: str,
-        success: bool,
-        actor: str = "system"
-    ) -> AuditEvent:
-        """
-        Log a signature verification attempt.
-        
-        Args:
-            key_id: Key identifier used for verification
-            success: Whether verification succeeded
-            actor: Actor performing verification
-            
-        Returns:
-            Audit event
-        """
-        return self.log_event(
-            event_type=AuditEventType.SIGNATURE_VERIFIED if success else AuditEventType.SIGNATURE_FAILED,
+            action=f"key_{operation}",
+            outcome=outcome,
             actor=actor,
-            resource=key_id,
-            action="verify_signature",
-            outcome="success" if success else "failure"
+            metadata=metadata or {}
         )
+        self.log_event(event)
     
-    def log_mac_verification(
+    def log_access_attempt(
         self,
         resource: str,
-        success: bool,
-        actor: str = "system"
-    ) -> AuditEvent:
+        action: str,
+        outcome: str,
+        actor: Optional[str] = None,
+        actor_ip: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> None:
         """
-        Log a MAC verification attempt.
+        Convenience method for logging access attempts.
         
         Args:
-            resource: Resource being verified
-            success: Whether verification succeeded
-            actor: Actor performing verification
-            
-        Returns:
-            Audit event
+            resource: Resource being accessed
+            action: Action being performed
+            outcome: Access outcome
+            actor: Actor attempting access
+            actor_ip: IP address of actor
+            metadata: Additional metadata
         """
-        return self.log_event(
-            event_type=AuditEventType.MAC_VERIFIED if success else AuditEventType.MAC_FAILED,
-            actor=actor,
+        event = AuditEvent(
+            event_type="access_attempt",
+            timestamp=time.time(),
             resource=resource,
-            action="verify_mac",
-            outcome="success" if success else "failure"
+            action=action,
+            outcome=outcome,
+            actor=actor,
+            actor_ip=actor_ip,
+            metadata=metadata or {}
         )
+        self.log_event(event)
     
-    def log_replay_detected(
+    def get_stats(self) -> Dict[str, Any]:
+        """Get audit logger statistics."""
+        return self.stats.copy()
+    
+    def verify_log_integrity(self, start_time: Optional[float] = None, end_time: Optional[float] = None) -> bool:
+        """
+        Verify integrity of audit logs using hash chain.
+        
+        Args:
+            start_time: Start time for verification (Unix timestamp)
+            end_time: End time for verification (Unix timestamp)
+            
+        Returns:
+            True if logs are tamper-free
+        """
+        if not self.hash_chain:
+            return True  # No hash chain to verify
+        
+        try:
+            events = []
+            
+            # Read log file and extract events
+            with open(self.log_file, 'r') as f:
+                for line in f:
+                    try:
+                        event_dict = json.loads(line.strip())
+                        
+                        # Filter by time range if specified
+                        event_time = event_dict.get('timestamp', 0)
+                        if start_time and event_time < start_time:
+                            continue
+                        if end_time and event_time > end_time:
+                            continue
+                        
+                        # Extract chain hash
+                        chain_hash = event_dict.pop('chain_hash', None)
+                        if chain_hash:
+                            event_data = json.dumps(event_dict, sort_keys=True).encode()
+                            events.append((event_data, chain_hash))
+                    
+                    except json.JSONDecodeError:
+                        continue
+            
+            # Verify chain
+            return self.hash_chain.verify_chain(events)
+        
+        except Exception as e:
+            logging.getLogger('resonagraph.audit.error').error(f"Failed to verify log integrity: {e}")
+            return False
+
+
+class AnonymizedAuditLogger:
+    """
+    Wrapper for audit logger with specific anonymization settings.
+    """
+    
+    def __init__(
         self,
-        key: str,
-        epoch: int,
-        nonce: Optional[str] = None
-    ) -> AuditEvent:
+        base_logger: AuditLogger,
+        anonymizer: Anonymizer
+    ):
         """
-        Log a replay attack detection.
+        Initialize anonymized audit logger.
         
         Args:
-            key: Beacon key
-            epoch: Epoch number
-            nonce: Optional nonce
-            
-        Returns:
-            Audit event
+            base_logger: Base audit logger
+            anonymizer: Anonymizer to use
         """
-        return self.log_event(
-            event_type=AuditEventType.REPLAY_DETECTED,
-            actor="system",
-            resource=key,
-            action="beacon_validation",
-            outcome="replay_detected",
-            metadata={'epoch': epoch, 'nonce': nonce}
-        )
+        self.base_logger = base_logger
+        self.anonymizer = anonymizer
     
-    def verify_hash_chain(self, events: List[AuditEvent]) -> bool:
-        """
-        Verify the integrity of a hash chain.
-        
-        Args:
-            events: List of events in order
-            
-        Returns:
-            True if hash chain is valid
-        """
-        if not self.enable_hash_chain:
-            return True
-        
-        previous_hash = None
-        for event in events:
-            # Check that previous_hash matches
-            if event.previous_hash != previous_hash:
-                return False
-            
-            # Compute and verify event hash
-            expected_hash = event.compute_hash()
-            if event.event_hash != expected_hash:
-                return False
-            
-            previous_hash = event.event_hash
-        
-        return True
+    def log_event(self, event: AuditEvent) -> None:
+        """Log event with anonymization."""
+        anonymized_event = self.anonymizer.anonymize_event(event)
+        self.base_logger.log_event(anonymized_event)
     
-    def get_last_hash(self) -> Optional[str]:
-        """
-        Get the last hash in the chain.
+    def __getattr__(self, name):
+        """Delegate other methods to base logger."""
+        return getattr(self.base_logger, name)
+
+
+# Factory function for easy setup
+def create_audit_logger(
+    log_file: str,
+    anonymization_level: AnonymizationLevel = AnonymizationLevel.MEDIUM,
+    **kwargs
+) -> AuditLogger:
+    """
+    Create audit logger with specified configuration.
+    
+    Args:
+        log_file: Path to audit log file
+        anonymization_level: Level of anonymization
+        **kwargs: Additional arguments for AuditLogger
         
-        Returns:
-            Last hash or None
-        """
-        return self._last_hash
+    Returns:
+        Configured audit logger
+    """
+    anonymizer = Anonymizer(anonymization_level)
+    return AuditLogger(log_file, anonymizer=anonymizer, **kwargs)

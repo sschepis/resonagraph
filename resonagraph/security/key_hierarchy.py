@@ -1,361 +1,476 @@
 """
-Key hierarchy and rotation for ResonaGraph.
+Key hierarchy management for ResonaGraph.
 
-According to copilot-instructions.md Section 5 and NEXT_STEPS.md 6.1:
-- Root K_root derives per-topic K_topic via HKDF
-- Automatic 24-hour rotation schedule
-- Key version tracking in beacons
-- HSM integration ready for production
+Implements HKDF-based key derivation, automatic rotation, and HSM integration
+according to Phase 6A specifications.
 """
 
 import hashlib
 import hmac
 import secrets
 import time
-from typing import Optional, Dict, Tuple
-from datetime import datetime, timedelta
-from dataclasses import dataclass
 import threading
+from datetime import datetime, timedelta
+from typing import Dict, Optional, Set, Tuple, Any, Callable
+from dataclasses import dataclass
+from enum import Enum
 
-from ..core.phase_key import PhaseKey
+from resonagraph.core.phase_key import PhaseKey
+from resonagraph.security.hsm import HSMInterface, MockHSM
+from resonagraph.security.audit import AuditLogger, AuditEvent
+
+
+class KeyType(Enum):
+    """Types of keys in the hierarchy."""
+    ROOT = "root"
+    TOPIC = "topic" 
+    ROLE = "role"
+    SESSION = "session"
+
+
+class KeyStatus(Enum):
+    """Key lifecycle status."""
+    ACTIVE = "active"
+    ROTATED = "rotated"
+    REVOKED = "revoked"
+    EXPIRED = "expired"
 
 
 @dataclass
-class KeyVersion:
-    """
-    Represents a versioned key with metadata.
+class KeyMetadata:
+    """Metadata for a managed key."""
+    key_id: str
+    key_type: KeyType
+    created_at: datetime
+    expires_at: Optional[datetime]
+    status: KeyStatus
+    parent_key_id: Optional[str] = None
+    topic: Optional[str] = None
+    role: Optional[str] = None
+    rotation_interval: int = 86400  # 24 hours default
     
-    Attributes:
-        key: The phase key
-        version: Key version number
-        created_at: Timestamp when key was created
-        expires_at: Timestamp when key expires
-        purpose: Key purpose/context
-    """
-    key: PhaseKey
-    version: int
-    created_at: float
-    expires_at: float
-    purpose: str
+    @property
+    def is_expired(self) -> bool:
+        """Check if key has expired."""
+        if self.expires_at is None:
+            return False
+        return datetime.utcnow() > self.expires_at
+    
+    @property
+    def needs_rotation(self) -> bool:
+        """Check if key needs rotation."""
+        if self.status != KeyStatus.ACTIVE:
+            return False
+        next_rotation = self.created_at + timedelta(seconds=self.rotation_interval)
+        return datetime.utcnow() > next_rotation
 
 
 class KeyHierarchy:
     """
-    Manages hierarchical key derivation using HKDF.
+    Manages hierarchical key derivation and rotation.
     
-    According to design.md Section 6.1:
-    - K_root derives per-topic K_topic via HKDF
-    - Domain separation for different key types
-    - Key context information (purpose, timestamp, version)
-    
-    This implements RFC 5869 HKDF with SHA-256.
+    Key Structure:
+    - Root Key (K_root): Stored in HSM, never rotated automatically
+    - Topic Keys (K_topic): Derived from root, rotated every 24h
+    - Role Keys (K_role): Derived from topic, role-specific access
+    - Session Keys: Short-lived keys for specific operations
     """
     
-    def __init__(self, root_key: Optional[PhaseKey] = None):
+    def __init__(
+        self, 
+        hsm: Optional[HSMInterface] = None,
+        audit_logger: Optional[AuditLogger] = None,
+        auto_rotation: bool = True
+    ):
         """
-        Initialize key hierarchy.
+        Initialize key hierarchy manager.
         
         Args:
-            root_key: Root key for derivation (generated if not provided)
+            hsm: HSM interface for root key storage (uses MockHSM if None)
+            audit_logger: Audit logger for key operations
+            auto_rotation: Enable automatic key rotation
         """
-        self._root_key = root_key or PhaseKey.generate()
-        self._derived_keys: Dict[str, KeyVersion] = {}
-        self._lock = threading.Lock()
+        self.hsm = hsm or MockHSM()
+        self.audit_logger = audit_logger
+        self._keys: Dict[str, KeyMetadata] = {}
+        self._derived_keys: Dict[str, PhaseKey] = {}
+        self._rotation_lock = threading.RLock()
+        self._rotation_scheduler: Optional[KeyRotationScheduler] = None
+        
+        if auto_rotation:
+            self._rotation_scheduler = KeyRotationScheduler(self)
+            self._rotation_scheduler.start()
     
-    def derive_key(
-        self,
-        context: str,
-        purpose: str = "default",
-        version: int = 1,
-        salt: Optional[bytes] = None
-    ) -> PhaseKey:
+    def create_root_key(self, key_id: str = "root") -> str:
         """
-        Derive a key from the root key using HKDF.
-        
-        According to RFC 5869:
-        - HKDF-Extract: PRK = HMAC-Hash(salt, IKM)
-        - HKDF-Expand: OKM = HMAC-Hash(PRK, info || counter)
+        Create or retrieve root key from HSM.
         
         Args:
-            context: Context for key derivation (e.g., topic name)
-            purpose: Key purpose (default, signing, encryption, etc.)
-            version: Key version number
-            salt: Optional salt (random if not provided)
+            key_id: Identifier for the root key
             
         Returns:
-            Derived phase key
+            Key ID of the created/retrieved root key
         """
-        if salt is None:
-            salt = secrets.token_bytes(32)
+        # Check if root key already exists
+        if self.hsm.key_exists(key_id):
+            self._log_audit_event("root_key_retrieved", key_id)
+            metadata = KeyMetadata(
+                key_id=key_id,
+                key_type=KeyType.ROOT,
+                created_at=datetime.utcnow(),
+                expires_at=None,  # Root keys don't expire
+                status=KeyStatus.ACTIVE
+            )
+            self._keys[key_id] = metadata
+            return key_id
         
-        # HKDF Extract: PRK = HMAC-Hash(salt, IKM)
-        prk = hmac.new(salt, self._root_key.get_bytes(), hashlib.sha256).digest()
+        # Generate new root key
+        root_key_bytes = secrets.token_bytes(32)
+        self.hsm.store_key(key_id, root_key_bytes)
         
-        # Build info string with domain separation
-        # Format: context||purpose||version
-        info = f"{context}||{purpose}||{version}".encode('utf-8')
+        metadata = KeyMetadata(
+            key_id=key_id,
+            key_type=KeyType.ROOT,
+            created_at=datetime.utcnow(),
+            expires_at=None,
+            status=KeyStatus.ACTIVE
+        )
+        self._keys[key_id] = metadata
         
-        # HKDF Expand: OKM = HMAC-Hash(PRK, info || 0x01)
-        # For 256-bit keys, we only need one iteration
-        okm = hmac.new(prk, info + b'\x01', hashlib.sha256).digest()
-        
-        return PhaseKey(okm)
+        self._log_audit_event("root_key_created", key_id)
+        return key_id
     
     def derive_topic_key(
         self,
         topic: str,
-        version: int = 1,
-        ttl_seconds: float = 86400  # 24 hours default
-    ) -> KeyVersion:
+        root_key_id: str = "root",
+        rotation_interval: int = 86400
+    ) -> PhaseKey:
         """
-        Derive a per-topic key with version tracking.
-        
-        According to copilot-instructions.md:
-        - Root K_root derives per-topic K_topic via HKDF
-        - Keys expire after 24 hours (configurable)
+        Derive a topic-specific key from root key.
         
         Args:
-            topic: Topic identifier
-            version: Key version
-            ttl_seconds: Time-to-live in seconds (default 24h)
+            topic: Topic name for key derivation
+            root_key_id: Root key to derive from
+            rotation_interval: Rotation interval in seconds
             
         Returns:
-            KeyVersion with metadata
+            Derived PhaseKey for the topic
         """
-        with self._lock:
-            cache_key = f"{topic}::{version}"
+        with self._rotation_lock:
+            # Check if we have a current active topic key
+            topic_key_id = f"{root_key_id}:topic:{topic}"
             
-            # Check cache
-            if cache_key in self._derived_keys:
-                key_version = self._derived_keys[cache_key]
-                # Return cached key if not expired
-                if time.time() < key_version.expires_at:
-                    return key_version
+            if topic_key_id in self._keys:
+                metadata = self._keys[topic_key_id]
+                if metadata.status == KeyStatus.ACTIVE and not metadata.needs_rotation:
+                    # Return cached key
+                    if topic_key_id in self._derived_keys:
+                        return self._derived_keys[topic_key_id]
             
-            # Derive new key
-            key = self.derive_key(topic, purpose="topic", version=version)
+            # Derive new topic key
+            root_key_bytes = self.hsm.get_key(root_key_id)
+            if root_key_bytes is None:
+                raise ValueError(f"Root key {root_key_id} not found")
             
-            now = time.time()
-            key_version = KeyVersion(
-                key=key,
-                version=version,
-                created_at=now,
-                expires_at=now + ttl_seconds,
-                purpose=f"topic:{topic}"
+            root_key = PhaseKey(root_key_bytes)
+            topic_key = PhaseKey.derive_topic_key(root_key, topic)
+            
+            # Store metadata
+            metadata = KeyMetadata(
+                key_id=topic_key_id,
+                key_type=KeyType.TOPIC,
+                created_at=datetime.utcnow(),
+                expires_at=None,
+                status=KeyStatus.ACTIVE,
+                parent_key_id=root_key_id,
+                topic=topic,
+                rotation_interval=rotation_interval
             )
+            self._keys[topic_key_id] = metadata
+            self._derived_keys[topic_key_id] = topic_key
             
-            # Cache the key
-            self._derived_keys[cache_key] = key_version
-            
-            return key_version
+            self._log_audit_event("topic_key_derived", topic_key_id, {"topic": topic})
+            return topic_key
     
     def derive_role_key(
         self,
         role: str,
-        resource: str,
-        version: int = 1
+        topic: str,
+        root_key_id: str = "root"
     ) -> PhaseKey:
         """
-        Derive a role-based access key.
-        
-        According to NEXT_STEPS.md 6.1:
-        - Role-based key derivation (admin, user, read-only)
-        - Hierarchical access (parent keys unlock child data)
+        Derive a role-specific key from topic key.
         
         Args:
-            role: Role identifier (admin, user, read-only, etc.)
-            resource: Resource identifier
-            version: Key version
+            role: Role name (e.g., "admin", "user", "readonly")
+            topic: Topic name
+            root_key_id: Root key identifier
             
         Returns:
-            Derived phase key for role
+            Derived PhaseKey for the role
         """
-        context = f"{role}::{resource}"
-        return self.derive_key(context, purpose="role", version=version)
+        # First get the topic key
+        topic_key = self.derive_topic_key(topic, root_key_id)
+        
+        # Derive role key using HKDF with role as context
+        role_key_id = f"{root_key_id}:role:{topic}:{role}"
+        
+        if role_key_id in self._derived_keys:
+            return self._derived_keys[role_key_id]
+        
+        # HKDF for role derivation
+        salt = hashlib.sha256(f"role:{role}".encode()).digest()[:16]
+        prk = hmac.new(salt, topic_key.get_bytes(), hashlib.sha256).digest()
+        info = f"role:{role}:topic:{topic}".encode()
+        okm = hmac.new(prk, info + b'\x01', hashlib.sha256).digest()
+        
+        role_key = PhaseKey(okm)
+        
+        # Store metadata
+        metadata = KeyMetadata(
+            key_id=role_key_id,
+            key_type=KeyType.ROLE,
+            created_at=datetime.utcnow(),
+            expires_at=None,
+            status=KeyStatus.ACTIVE,
+            parent_key_id=f"{root_key_id}:topic:{topic}",
+            topic=topic,
+            role=role
+        )
+        self._keys[role_key_id] = metadata
+        self._derived_keys[role_key_id] = role_key
+        
+        self._log_audit_event("role_key_derived", role_key_id, {
+            "role": role, 
+            "topic": topic
+        })
+        return role_key
     
-    def get_root_key(self) -> PhaseKey:
+    def rotate_key(self, key_id: str, retain_old: bool = True) -> PhaseKey:
         """
-        Get the root key (for backup/restore purposes).
-        
-        WARNING: Root key should be protected with HSM in production.
-        
-        Returns:
-            Root phase key
-        """
-        return self._root_key
-    
-    def rotate_root_key(self, new_root_key: PhaseKey) -> None:
-        """
-        Rotate the root key.
-        
-        This invalidates all derived keys and requires re-derivation.
-        Use with caution - typically done during security incidents.
+        Rotate a specific key.
         
         Args:
-            new_root_key: New root key
+            key_id: Key to rotate
+            retain_old: Keep old key for grace period
+            
+        Returns:
+            New rotated key
         """
-        with self._lock:
-            self._root_key = new_root_key
-            # Clear derived key cache
-            self._derived_keys.clear()
+        with self._rotation_lock:
+            if key_id not in self._keys:
+                raise ValueError(f"Key {key_id} not found")
+            
+            old_metadata = self._keys[key_id]
+            
+            if old_metadata.key_type == KeyType.ROOT:
+                raise ValueError("Root keys cannot be automatically rotated")
+            
+            # Mark old key as rotated
+            if retain_old:
+                old_metadata.status = KeyStatus.ROTATED
+                old_metadata.expires_at = datetime.utcnow() + timedelta(hours=1)
+            else:
+                old_metadata.status = KeyStatus.REVOKED
+                if key_id in self._derived_keys:
+                    del self._derived_keys[key_id]
+            
+            # Create new key
+            if old_metadata.key_type == KeyType.TOPIC:
+                new_key = self.derive_topic_key(
+                    old_metadata.topic,
+                    old_metadata.parent_key_id,
+                    old_metadata.rotation_interval
+                )
+            elif old_metadata.key_type == KeyType.ROLE:
+                new_key = self.derive_role_key(
+                    old_metadata.role,
+                    old_metadata.topic,
+                    old_metadata.parent_key_id.split(':')[0]  # Extract root key ID
+                )
+            else:
+                raise ValueError(f"Cannot rotate key type {old_metadata.key_type}")
+            
+            self._log_audit_event("key_rotated", key_id, {
+                "old_status": old_metadata.status.value,
+                "retain_old": retain_old
+            })
+            
+            return new_key
+    
+    def revoke_key(self, key_id: str) -> None:
+        """
+        Revoke a key immediately.
+        
+        Args:
+            key_id: Key to revoke
+        """
+        with self._rotation_lock:
+            if key_id not in self._keys:
+                raise ValueError(f"Key {key_id} not found")
+            
+            metadata = self._keys[key_id]
+            metadata.status = KeyStatus.REVOKED
+            
+            # Remove from derived keys cache
+            if key_id in self._derived_keys:
+                del self._derived_keys[key_id]
+            
+            self._log_audit_event("key_revoked", key_id)
+    
+    def cleanup_expired_keys(self) -> int:
+        """
+        Clean up expired keys.
+        
+        Returns:
+            Number of keys cleaned up
+        """
+        cleanup_count = 0
+        expired_keys = []
+        
+        with self._rotation_lock:
+            for key_id, metadata in self._keys.items():
+                if metadata.is_expired or metadata.status == KeyStatus.REVOKED:
+                    expired_keys.append(key_id)
+            
+            for key_id in expired_keys:
+                if key_id in self._derived_keys:
+                    del self._derived_keys[key_id]
+                # Keep metadata for audit purposes
+                cleanup_count += 1
+        
+        if cleanup_count > 0:
+            self._log_audit_event("keys_cleaned_up", "system", {
+                "cleanup_count": cleanup_count
+            })
+        
+        return cleanup_count
+    
+    def get_key_metadata(self, key_id: str) -> Optional[KeyMetadata]:
+        """Get metadata for a key."""
+        return self._keys.get(key_id)
+    
+    def list_keys(self, key_type: Optional[KeyType] = None, status: Optional[KeyStatus] = None) -> Dict[str, KeyMetadata]:
+        """
+        List keys with optional filtering.
+        
+        Args:
+            key_type: Filter by key type
+            status: Filter by key status
+            
+        Returns:
+            Dict of key_id -> metadata
+        """
+        result = {}
+        for key_id, metadata in self._keys.items():
+            if key_type and metadata.key_type != key_type:
+                continue
+            if status and metadata.status != status:
+                continue
+            result[key_id] = metadata
+        return result
+    
+    def _log_audit_event(self, event_type: str, key_id: str, metadata: Optional[Dict] = None) -> None:
+        """Log audit event if logger is available."""
+        if self.audit_logger:
+            event = AuditEvent(
+                event_type=event_type,
+                resource=key_id,
+                action="key_operation",
+                outcome="success",
+                metadata=metadata or {}
+            )
+            self.audit_logger.log_event(event)
+    
+    def shutdown(self) -> None:
+        """Shutdown the key hierarchy manager."""
+        if self._rotation_scheduler:
+            self._rotation_scheduler.stop()
 
 
 class KeyRotationScheduler:
     """
-    Manages automatic key rotation on a schedule.
+    Automatic key rotation scheduler.
     
-    According to copilot-instructions.md:
-    - Rotate keys every 24h for security
-    - Graceful key transition (overlap period)
-    - Key version tracking in beacons
+    Runs in background thread and rotates keys based on their rotation intervals.
     """
     
-    def __init__(
-        self,
-        key_hierarchy: KeyHierarchy,
-        rotation_interval: float = 86400,  # 24 hours
-        overlap_period: float = 3600  # 1 hour overlap
-    ):
+    def __init__(self, key_hierarchy: KeyHierarchy, check_interval: int = 300):
         """
-        Initialize key rotation scheduler.
+        Initialize rotation scheduler.
         
         Args:
-            key_hierarchy: KeyHierarchy instance to manage
-            rotation_interval: Rotation interval in seconds (default 24h)
-            overlap_period: Grace period where old and new keys both valid
+            key_hierarchy: Key hierarchy to manage
+            check_interval: How often to check for rotations (seconds)
         """
         self.key_hierarchy = key_hierarchy
-        self.rotation_interval = rotation_interval
-        self.overlap_period = overlap_period
-        self._active_versions: Dict[str, int] = {}
-        self._key_creation_times: Dict[str, float] = {}  # Track when keys were created
-        self._lock = threading.Lock()
+        self.check_interval = check_interval
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
     
-    def get_current_version(self, topic: str) -> int:
-        """
-        Get the current active version for a topic.
+    def start(self) -> None:
+        """Start the rotation scheduler."""
+        if self._running:
+            return
         
-        Args:
-            topic: Topic identifier
-            
-        Returns:
-            Current version number
-        """
-        with self._lock:
-            return self._active_versions.get(topic, 1)
+        self._running = True
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._rotation_loop, daemon=True)
+        self._thread.start()
     
-    def get_active_keys(self, topic: str) -> Tuple[KeyVersion, Optional[KeyVersion]]:
-        """
-        Get active keys for a topic (current and previous if in overlap).
+    def stop(self) -> None:
+        """Stop the rotation scheduler."""
+        if not self._running:
+            return
         
-        During the overlap period, both current and previous keys are valid
-        to allow graceful transition.
-        
-        Args:
-            topic: Topic identifier
-            
-        Returns:
-            Tuple of (current_key, previous_key or None)
-        """
-        with self._lock:
-            current_version = self._active_versions.get(topic, 1)
-            
-            # Check if we need to initialize
-            cache_key = f"{topic}::{current_version}"
-            if cache_key not in self._key_creation_times:
-                # First time accessing this topic/version
-                current_key = self.key_hierarchy.derive_topic_key(
-                    topic, 
-                    version=current_version,
-                    ttl_seconds=self.rotation_interval + self.overlap_period
-                )
-                self._key_creation_times[cache_key] = current_key.created_at
-                self._active_versions[topic] = current_version
-            else:
-                # Use cached creation time
-                current_key = self.key_hierarchy.derive_topic_key(
-                    topic, 
-                    version=current_version,
-                    ttl_seconds=self.rotation_interval + self.overlap_period
-                )
-            
-            # Check if we're in overlap period
-            now = time.time()
-            creation_time = self._key_creation_times[cache_key]
-            time_since_creation = now - creation_time
-            
-            previous_key = None
-            if time_since_creation < self.overlap_period and current_version > 1:
-                # We're in overlap period, also return previous key
-                previous_key = self.key_hierarchy.derive_topic_key(
-                    topic,
-                    version=current_version - 1,
-                    ttl_seconds=self.rotation_interval + self.overlap_period
-                )
-            
-            return current_key, previous_key
+        self._running = False
+        self._stop_event.set()
+        if self._thread:
+            self._thread.join()
     
-    def should_rotate(self, topic: str) -> bool:
-        """
-        Check if a topic's key should be rotated.
-        
-        Args:
-            topic: Topic identifier
+    def _rotation_loop(self) -> None:
+        """Main rotation loop."""
+        while self._running and not self._stop_event.is_set():
+            try:
+                self._check_and_rotate_keys()
+                self.key_hierarchy.cleanup_expired_keys()
+            except Exception as e:
+                # Log error but continue running
+                if self.key_hierarchy.audit_logger:
+                    event = AuditEvent(
+                        event_type="rotation_error",
+                        resource="scheduler",
+                        action="auto_rotation",
+                        outcome="error",
+                        metadata={"error": str(e)}
+                    )
+                    self.key_hierarchy.audit_logger.log_event(event)
             
-        Returns:
-            True if rotation is needed
-        """
-        with self._lock:
-            current_version = self._active_versions.get(topic, 1)
-            cache_key = f"{topic}::{current_version}"
-            
-            # If we haven't created this key yet, no rotation needed
-            if cache_key not in self._key_creation_times:
-                return False
-            
-            # Check time since creation
-            now = time.time()
-            time_since_creation = now - self._key_creation_times[cache_key]
-            
-            return time_since_creation >= self.rotation_interval
+            # Wait for next check or stop signal
+            self._stop_event.wait(self.check_interval)
     
-    def rotate_key(self, topic: str) -> KeyVersion:
-        """
-        Rotate a topic's key to the next version.
+    def _check_and_rotate_keys(self) -> None:
+        """Check keys and rotate those that need rotation."""
+        keys_to_rotate = []
         
-        Args:
-            topic: Topic identifier
-            
-        Returns:
-            New key version
-        """
-        with self._lock:
-            current_version = self._active_versions.get(topic, 1)
-            new_version = current_version + 1
-            self._active_versions[topic] = new_version
-            
-            new_key = self.key_hierarchy.derive_topic_key(
-                topic,
-                version=new_version,
-                ttl_seconds=self.rotation_interval + self.overlap_period
-            )
-            
-            # Track creation time for new version
-            cache_key = f"{topic}::{new_version}"
-            self._key_creation_times[cache_key] = new_key.created_at
-            
-            return new_key
-    
-    def auto_rotate_if_needed(self, topic: str) -> Optional[KeyVersion]:
-        """
-        Automatically rotate key if needed.
+        # Find keys that need rotation
+        for key_id, metadata in self.key_hierarchy.list_keys().items():
+            if metadata.needs_rotation and metadata.key_type != KeyType.ROOT:
+                keys_to_rotate.append(key_id)
         
-        Args:
-            topic: Topic identifier
-            
-        Returns:
-            New key version if rotated, None otherwise
-        """
-        if self.should_rotate(topic):
-            return self.rotate_key(topic)
-        return None
+        # Rotate each key
+        for key_id in keys_to_rotate:
+            try:
+                self.key_hierarchy.rotate_key(key_id, retain_old=True)
+            except Exception as e:
+                if self.key_hierarchy.audit_logger:
+                    event = AuditEvent(
+                        event_type="rotation_failed",
+                        resource=key_id,
+                        action="auto_rotation",
+                        outcome="error",
+                        metadata={"error": str(e)}
+                    )
+                    self.key_hierarchy.audit_logger.log_event(event)

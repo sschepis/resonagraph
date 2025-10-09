@@ -1,253 +1,603 @@
 """
-Tests for beacon structure implementation.
+Test suite for enhanced beacon with cryptographic security.
 
-Tests beacon serialization, deserialization, and cryptographic features
-according to copilot-instructions.md Section 7 (Testing Strategies).
+Tests the enhanced beacon class with Ed25519 signatures and HMAC-based
+integrity protection according to Phase 6B security specifications.
 """
 
 import pytest
 import time
-from cryptography.hazmat.primitives.asymmetric import ed25519
+import secrets
+import struct
+from typing import List, Optional
+from unittest.mock import Mock, patch
 
 from resonagraph.gossip.beacon import (
-    Beacon,
-    BeaconMetadata,
-    TAU_EPOCH,
-    MIN_BEACON_SIZE,
-    MAX_BEACON_SIZE
+    Beacon, BeaconMetadata, SecurityError,
+    create_signed_beacon, create_secure_beacon
 )
+from resonagraph.security.signatures import SignatureKeyManager
+from resonagraph.security.integrity import IntegrityManager
+from resonagraph.security.audit import AuditLogger
 
 
-class TestBeacon:
-    """Test beacon structure and operations."""
+class TestBeaconMetadata:
+    """Test beacon metadata structure."""
     
-    def test_beacon_initialization(self):
-        """Test basic beacon creation."""
-        key = "vertex:user_123"
-        primes = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37]
-        phase_angles = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2]
+    def test_init_basic(self):
+        """Test basic metadata initialization."""
+        metadata = BeaconMetadata(
+            key="test_beacon",
+            primes=[2, 3, 5],
+            epoch=1640995200.0,
+            phase_fingerprint=0x123456789ABCDEF0
+        )
         
-        beacon = Beacon(key, primes, phase_angles)
+        assert metadata.key == "test_beacon"
+        assert metadata.primes == [2, 3, 5]
+        assert metadata.epoch == 1640995200.0
+        assert metadata.phase_fingerprint == 0x123456789ABCDEF0
+        assert metadata.signature is None
+        assert metadata.signer_key_id is None
+        assert metadata.chunk_macs is None
+        assert metadata.node_id is None
+        assert metadata.ttl == 3
+        assert metadata.created_at is not None
+    
+    def test_init_with_security_fields(self):
+        """Test metadata initialization with security fields."""
+        signature = secrets.token_bytes(64)
+        chunk_macs = [secrets.token_bytes(32) for _ in range(3)]
+        
+        metadata = BeaconMetadata(
+            key="secure_beacon",
+            primes=[2, 3, 5, 7],
+            epoch=time.time(),
+            phase_fingerprint=0xDEADBEEF,
+            signature=signature,
+            signer_key_id="test_key_001",
+            chunk_macs=chunk_macs,
+            node_id="test_node"
+        )
+        
+        assert metadata.signature == signature
+        assert metadata.signer_key_id == "test_key_001"
+        assert metadata.chunk_macs == chunk_macs
+        assert metadata.node_id == "test_node"
+
+
+class TestBasicBeacon:
+    """Test basic beacon functionality without security."""
+    
+    def test_init_basic(self):
+        """Test basic beacon initialization."""
+        key = "test_beacon"
+        primes = [2, 3, 5, 7]
+        phase_angles = [1.23, 4.56, 7.89, 2.34]
+        
+        beacon = Beacon(
+            key=key,
+            primes=primes,
+            phase_angles=phase_angles
+        )
         
         assert beacon.key == key
         assert beacon.primes == primes
         assert beacon.phase_angles == phase_angles
-        assert beacon.epoch > 0
-        assert beacon.phase_fingerprint > 0
+        assert beacon.node_id is None
+        assert beacon.signature is None
+        assert beacon.chunk_macs is None
+        assert isinstance(beacon.epoch, float)
+        assert isinstance(beacon.phase_fingerprint, int)
     
-    def test_epoch_computation(self):
-        """Test epoch timestamp computation."""
-        epoch = Beacon._compute_epoch()
-        current_time = int(time.time())
-        expected_epoch = current_time // TAU_EPOCH
+    def test_phase_fingerprint_computation(self):
+        """Test phase fingerprint computation."""
+        beacon1 = Beacon(
+            key="test",
+            primes=[2, 3],
+            phase_angles=[1.0, 2.0]
+        )
         
-        assert epoch == expected_epoch
+        beacon2 = Beacon(
+            key="test",
+            primes=[2, 3],
+            phase_angles=[1.0, 2.0]
+        )
         
-        # Epoch should be stable within τ window
-        time.sleep(0.1)
-        epoch2 = Beacon._compute_epoch()
-        assert epoch2 == epoch  # Should be same within small time window
-    
-    def test_phase_fingerprint_deterministic(self):
-        """Test that phase fingerprint is deterministic."""
-        key = "vertex:test"
-        primes = [2, 3, 5, 7]
-        phase_angles = [1.0, 2.0, 3.0, 4.0]
+        beacon3 = Beacon(
+            key="test",
+            primes=[2, 3],
+            phase_angles=[1.1, 2.0]  # Slightly different
+        )
         
-        beacon1 = Beacon(key, primes, phase_angles)
-        beacon2 = Beacon(key, primes, phase_angles)
-        
+        # Same angles should produce same fingerprint
         assert beacon1.phase_fingerprint == beacon2.phase_fingerprint
+        
+        # Different angles should produce different fingerprint
+        assert beacon1.phase_fingerprint != beacon3.phase_fingerprint
     
-    def test_phase_fingerprint_different_phases(self):
-        """Test that different phases produce different fingerprints."""
-        key = "vertex:test"
-        primes = [2, 3, 5, 7]
+    def test_size_calculation(self):
+        """Test beacon size calculation."""
+        beacon = Beacon(
+            key="test_beacon",
+            primes=[2, 3, 5],
+            phase_angles=[1.0, 2.0, 3.0],
+            node_id="test_node"
+        )
         
-        beacon1 = Beacon(key, primes, [1.0, 2.0, 3.0, 4.0])
-        beacon2 = Beacon(key, primes, [1.1, 2.1, 3.1, 4.1])
-        
-        # Different phases should produce different fingerprints
-        # (Though there's a small chance of collision)
-        assert beacon1.phase_fingerprint != beacon2.phase_fingerprint
-    
-    def test_beacon_serialization_size(self):
-        """Test that beacon serialization produces correct size."""
-        key = "vertex:user_123"
-        primes = [2, 3, 5, 7, 11, 13, 17, 19]
-        phase_angles = [0.1 * i for i in range(8)]
-        
-        beacon = Beacon(key, primes, phase_angles)
-        serialized = beacon.serialize()
-        
-        # Should be at least minimum size
-        assert len(serialized) >= MIN_BEACON_SIZE
-        # Should not exceed maximum size
-        assert len(serialized) <= MAX_BEACON_SIZE
-        # Default implementation should be exactly header size
-        assert len(serialized) == Beacon.HEADER_SIZE
-    
-    def test_beacon_serialization_deserialization(self):
-        """Test beacon round-trip serialization."""
-        key = "vertex:user_123"
-        primes = [2, 3, 5, 7, 11, 13, 17, 19]
-        phase_angles = [0.1 * i for i in range(8)]
-        
-        beacon1 = Beacon(key, primes, phase_angles)
-        serialized = beacon1.serialize()
-        beacon2 = Beacon.deserialize(serialized)
-        
-        # Check that key properties are preserved
-        assert beacon2.epoch == beacon1.epoch
-        assert beacon2.phase_fingerprint == beacon1.phase_fingerprint
-        assert beacon2.signature == beacon1.signature
-        assert beacon2.mac == beacon1.mac
-    
-    def test_beacon_with_ed25519_signature(self):
-        """Test beacon with Ed25519 signature."""
-        # Generate Ed25519 key pair
-        private_key = ed25519.Ed25519PrivateKey.generate()
-        public_key = private_key.public_key()
-        
-        key = "vertex:user_123"
-        primes = [2, 3, 5, 7]
-        phase_angles = [1.0, 2.0, 3.0, 4.0]
-        
-        # Create beacon with signature
-        beacon = Beacon(key, primes, phase_angles, signing_key=private_key)
-        
-        # Signature should not be all zeros
-        assert beacon.signature != b'\x00' * 64
-        
-        # Serialize and deserialize
-        serialized = beacon.serialize()
-        deserialized = Beacon.deserialize(serialized, verify_key=public_key)
-        
-        # Should succeed without raising exception
-        assert deserialized.signature == beacon.signature
-    
-    def test_beacon_signature_verification_fails_with_wrong_key(self):
-        """Test that signature verification fails with wrong public key."""
-        # Generate two different key pairs
-        private_key1 = ed25519.Ed25519PrivateKey.generate()
-        private_key2 = ed25519.Ed25519PrivateKey.generate()
-        public_key2 = private_key2.public_key()
-        
-        key = "vertex:user_123"
-        primes = [2, 3, 5, 7]
-        phase_angles = [1.0, 2.0, 3.0, 4.0]
-        
-        # Create beacon with first key
-        beacon = Beacon(key, primes, phase_angles, signing_key=private_key1)
-        serialized = beacon.serialize()
-        
-        # Try to verify with second key (should fail)
-        with pytest.raises(ValueError, match="Signature verification failed"):
-            Beacon.deserialize(serialized, verify_key=public_key2)
-    
-    def test_beacon_with_hmac(self):
-        """Test beacon with HMAC."""
-        mac_key = b'test_mac_key_32_bytes_long_key!!'
-        
-        key = "vertex:user_123"
-        primes = [2, 3, 5, 7]
-        phase_angles = [1.0, 2.0, 3.0, 4.0]
-        
-        beacon = Beacon(key, primes, phase_angles, mac_key=mac_key)
-        
-        # MAC should not be all zeros
-        assert beacon.mac != b'\x00' * 32
-    
-    def test_beacon_metadata_conversion(self):
-        """Test conversion to metadata."""
-        key = "vertex:user_123"
-        primes = [2, 3, 5, 7]
-        phase_angles = [1.0, 2.0, 3.0, 4.0]
-        
-        beacon = Beacon(key, primes, phase_angles)
-        metadata = beacon.to_metadata()
-        
-        assert isinstance(metadata, BeaconMetadata)
-        assert metadata.key == key
-        assert metadata.primes == primes
-        assert metadata.epoch == beacon.epoch
-        assert metadata.phase_fingerprint == beacon.phase_fingerprint
-        assert metadata.version == Beacon.VERSION
-    
-    def test_beacon_size_method(self):
-        """Test beacon size() method."""
-        key = "vertex:user_123"
-        primes = [2, 3, 5, 7]
-        phase_angles = [1.0, 2.0, 3.0, 4.0]
-        
-        beacon = Beacon(key, primes, phase_angles)
         size = beacon.size()
         
-        assert size == len(beacon.serialize())
-        assert size == Beacon.HEADER_SIZE
+        # Should include base fields plus node_id
+        assert size > 0
+        assert isinstance(size, int)
     
-    def test_beacon_repr(self):
+    def test_string_representation(self):
         """Test beacon string representation."""
-        key = "vertex:user_123"
-        primes = [2, 3, 5, 7]
-        phase_angles = [1.0, 2.0, 3.0, 4.0]
+        beacon = Beacon(
+            key="test_beacon",
+            primes=[2, 3, 5],
+            phase_angles=[1.0, 2.0, 3.0]
+        )
         
-        beacon = Beacon(key, primes, phase_angles)
         repr_str = repr(beacon)
         
         assert "Beacon" in repr_str
-        assert key in repr_str
-        assert str(len(primes)) in repr_str
+        assert "test_beacon" in repr_str
+        assert "primes=3" in repr_str
+
+
+class TestBeaconWithSignatures:
+    """Test beacon functionality with Ed25519 signatures."""
     
-    def test_delta_encode_primes(self):
-        """Test prime delta encoding."""
-        key = "vertex:test"
-        primes = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29]
-        phase_angles = [0.1] * 10
+    @pytest.fixture
+    def signature_manager(self):
+        """Create a signature manager for testing."""
+        audit_logger = Mock(spec=AuditLogger)
+        manager = SignatureKeyManager(audit_logger=audit_logger)
         
-        beacon = Beacon(key, primes, phase_angles)
-        delta_encoded = beacon._delta_encode_primes()
+        # Generate a test key
+        key_id = manager.generate_signing_key(metadata={"purpose": "beacon_test"})
+        manager.default_key_id = key_id
         
-        # Should produce 16 bytes (128 bits)
-        assert len(delta_encoded) == 16
-        
-        # Should be deterministic
-        beacon2 = Beacon(key, primes, phase_angles)
-        delta_encoded2 = beacon2._delta_encode_primes()
-        assert delta_encoded == delta_encoded2
+        return manager
     
-    def test_deserialization_invalid_version(self):
-        """Test that deserialization rejects invalid version."""
-        key = "vertex:test"
-        primes = [2, 3, 5, 7]
-        phase_angles = [1.0, 2.0, 3.0, 4.0]
+    def test_beacon_with_signature_manager(self, signature_manager):
+        """Test beacon creation with signature manager."""
+        beacon = Beacon(
+            key="signed_beacon",
+            primes=[2, 3, 5],
+            phase_angles=[1.0, 2.0, 3.0],
+            signature_manager=signature_manager,
+            node_id="test_node"
+        )
         
-        beacon = Beacon(key, primes, phase_angles)
+        # Should have signature
+        assert beacon.signature is not None
+        assert len(beacon.signature) == 64  # Ed25519 signature length
+        assert beacon.signer_key_id is not None
+        
+        # Size should include signature
+        size_with_sig = beacon.size()
+        
+        # Create beacon without signature for comparison
+        beacon_no_sig = Beacon(
+            key="unsigned_beacon",
+            primes=[2, 3, 5],
+            phase_angles=[1.0, 2.0, 3.0]
+        )
+        
+        size_without_sig = beacon_no_sig.size()
+        assert size_with_sig > size_without_sig
+    
+    def test_signature_verification(self, signature_manager):
+        """Test beacon signature verification."""
+        beacon = Beacon(
+            key="verification_test",
+            primes=[2, 3, 5, 7],
+            phase_angles=[1.23, 4.56, 7.89, 2.34],
+            signature_manager=signature_manager
+        )
+        
+        # Verify signature
+        is_valid = beacon.verify_signature(signature_manager=signature_manager)
+        assert is_valid is True
+        
+        # Test with wrong manager should fail
+        wrong_manager = SignatureKeyManager(audit_logger=Mock())
+        is_invalid = beacon.verify_signature(signature_manager=wrong_manager)
+        assert is_invalid is False
+    
+    def test_legacy_signature_support(self):
+        """Test legacy signature support."""
+        from cryptography.hazmat.primitives.asymmetric import ed25519
+        
+        # Create legacy signing key
+        signing_key = ed25519.Ed25519PrivateKey.generate()
+        public_key = signing_key.public_key()
+        
+        beacon = Beacon(
+            key="legacy_beacon",
+            primes=[2, 3],
+            phase_angles=[1.0, 2.0],
+            signing_key=signing_key,
+            node_id="legacy_node"
+        )
+        
+        # Should have signature
+        assert beacon.signature is not None
+        assert beacon.signer_key_id.startswith("legacy:")
+        
+        # Should verify with public key
+        is_valid = beacon.verify_signature(public_key=public_key)
+        assert is_valid is True
+
+
+class TestBeaconWithIntegrity:
+    """Test beacon functionality with HMAC integrity protection."""
+    
+    @pytest.fixture
+    def integrity_manager(self):
+        """Create an integrity manager for testing."""
+        mac_key = secrets.token_bytes(32)
+        audit_logger = Mock(spec=AuditLogger)
+        return IntegrityManager(mac_key=mac_key, audit_logger=audit_logger)
+    
+    def test_beacon_with_integrity_manager(self, integrity_manager):
+        """Test beacon creation with integrity manager."""
+        beacon = Beacon(
+            key="integrity_beacon",
+            primes=[2, 3, 5],
+            phase_angles=[1.0, 2.0, 3.0],
+            integrity_manager=integrity_manager,
+            node_id="test_node"
+        )
+        
+        # Should have MACs
+        assert beacon.chunk_macs is not None
+        assert len(beacon.chunk_macs) == 3  # One per phase angle
+        assert all(len(mac) == 32 for mac in beacon.chunk_macs)  # SHA256 length
+    
+    def test_integrity_verification(self, integrity_manager):
+        """Test beacon integrity verification."""
+        beacon = Beacon(
+            key="integrity_verification",
+            primes=[2, 3, 5, 7],
+            phase_angles=[1.23, 4.56, 7.89, 2.34],
+            integrity_manager=integrity_manager,
+            node_id="verify_node"
+        )
+        
+        # First verification should succeed
+        is_valid = beacon.verify_integrity(integrity_manager=integrity_manager)
+        assert is_valid is True
+        
+        # Second verification should fail (replay protection)
+        is_replay = beacon.verify_integrity(integrity_manager=integrity_manager)
+        assert is_replay is False
+    
+    def test_legacy_mac_support(self):
+        """Test legacy MAC support."""
+        mac_key = secrets.token_bytes(32)
+        
+        beacon = Beacon(
+            key="legacy_mac_beacon",
+            primes=[2, 3],
+            phase_angles=[1.0, 2.0],
+            mac_key=mac_key
+        )
+        
+        # Should have MACs
+        assert beacon.chunk_macs is not None
+        assert len(beacon.chunk_macs) == 2
+        
+        # Should verify with same MAC key
+        is_valid = beacon.verify_integrity(mac_key=mac_key)
+        assert is_valid is True
+        
+        # Should fail with wrong MAC key
+        wrong_key = secrets.token_bytes(32)
+        is_invalid = beacon.verify_integrity(mac_key=wrong_key)
+        assert is_invalid is False
+
+
+class TestSecureBeacon:
+    """Test beacon with full security (signatures + integrity)."""
+    
+    @pytest.fixture
+    def security_managers(self):
+        """Create security managers for testing."""
+        audit_logger = Mock(spec=AuditLogger)
+        
+        signature_manager = SignatureKeyManager(audit_logger=audit_logger)
+        key_id = signature_manager.generate_signing_key()
+        signature_manager.default_key_id = key_id
+        
+        mac_key = secrets.token_bytes(32)
+        integrity_manager = IntegrityManager(mac_key=mac_key, audit_logger=audit_logger)
+        
+        return signature_manager, integrity_manager
+    
+    def test_fully_secure_beacon(self, security_managers):
+        """Test beacon with both signatures and integrity protection."""
+        signature_manager, integrity_manager = security_managers
+        
+        beacon = Beacon(
+            key="fully_secure_beacon",
+            primes=[2, 3, 5, 7, 11],
+            phase_angles=[1.1, 2.2, 3.3, 4.4, 5.5],
+            signature_manager=signature_manager,
+            integrity_manager=integrity_manager,
+            node_id="secure_node"
+        )
+        
+        # Should have both security features
+        assert beacon.signature is not None
+        assert beacon.signer_key_id is not None
+        assert beacon.chunk_macs is not None
+        assert len(beacon.chunk_macs) == 5
+        
+        # Both should verify
+        sig_valid = beacon.verify_signature(signature_manager=signature_manager)
+        integrity_valid = beacon.verify_integrity(integrity_manager=integrity_manager)
+        
+        assert sig_valid is True
+        assert integrity_valid is True
+        
+        # String representation should indicate security
+        repr_str = repr(beacon)
+        assert "signed" in repr_str
+        assert "mac-protected" in repr_str
+
+
+class TestBeaconSerialization:
+    """Test beacon serialization and deserialization."""
+    
+    @pytest.fixture
+    def secure_beacon(self):
+        """Create a secure beacon for serialization testing."""
+        audit_logger = Mock(spec=AuditLogger)
+        
+        signature_manager = SignatureKeyManager(audit_logger=audit_logger)
+        key_id = signature_manager.generate_signing_key()
+        signature_manager.default_key_id = key_id
+        
+        mac_key = secrets.token_bytes(32)
+        integrity_manager = IntegrityManager(mac_key=mac_key, audit_logger=audit_logger)
+        
+        return Beacon(
+            key="serialization_test",
+            primes=[2, 3, 5],
+            phase_angles=[1.0, 2.0, 3.0],
+            signature_manager=signature_manager,
+            integrity_manager=integrity_manager,
+            node_id="serial_node"
+        ), signature_manager, integrity_manager
+    
+    def test_serialize_basic_beacon(self):
+        """Test serialization of basic beacon."""
+        beacon = Beacon(
+            key="basic_beacon",
+            primes=[2, 3],
+            phase_angles=[1.0, 2.0]
+        )
+        
         serialized = beacon.serialize()
-        
-        # Corrupt the version byte (it's in the high byte of the first 4-byte word)
-        corrupted = bytearray(serialized)
-        corrupted[3] = 0xFF  # Set the version byte to invalid
-        
-        with pytest.raises(ValueError, match="Unsupported beacon version"):
-            Beacon.deserialize(bytes(corrupted))
+        assert isinstance(serialized, bytes)
+        assert len(serialized) > 0
     
-    def test_deserialization_too_short(self):
-        """Test that deserialization rejects too-short data."""
-        short_data = b'x' * 50  # Less than HEADER_SIZE
+    def test_serialize_secure_beacon(self, secure_beacon):
+        """Test serialization of secure beacon."""
+        beacon, signature_manager, integrity_manager = secure_beacon
         
-        with pytest.raises(ValueError, match="Beacon data too short"):
-            Beacon.deserialize(short_data)
+        serialized = beacon.serialize()
+        assert isinstance(serialized, bytes)
+        assert len(serialized) > 0
     
-    def test_multiple_beacons_different_keys(self):
-        """Test creating beacons for different keys."""
-        primes = [2, 3, 5, 7]
-        phase_angles = [1.0, 2.0, 3.0, 4.0]
+    def test_deserialize_basic_beacon(self):
+        """Test deserialization of basic beacon."""
+        original = Beacon(
+            key="deserial_test",
+            primes=[2, 3, 5],
+            phase_angles=[1.0, 2.0, 3.0],
+            node_id="deserial_node"
+        )
         
-        beacon1 = Beacon("vertex:user_1", primes, phase_angles)
-        beacon2 = Beacon("vertex:user_2", primes, phase_angles)
+        serialized = original.serialize()
+        deserialized = Beacon.deserialize(serialized)
         
-        # Different keys should produce different payload hashes
-        # but same epoch (if created within same window)
-        assert beacon1.epoch == beacon2.epoch
-        assert beacon1.key != beacon2.key
+        assert deserialized.key == original.key
+        assert deserialized.primes == original.primes
+        assert deserialized.phase_angles == original.phase_angles
+        assert deserialized.node_id == original.node_id
+        assert deserialized.phase_fingerprint == original.phase_fingerprint
+    
+    def test_deserialize_secure_beacon(self, secure_beacon):
+        """Test deserialization of secure beacon."""
+        original, signature_manager, integrity_manager = secure_beacon
+        
+        serialized = original.serialize()
+        
+        # Deserialize with security verification
+        deserialized = Beacon.deserialize(
+            serialized,
+            signature_manager=signature_manager,
+            integrity_manager=integrity_manager
+        )
+        
+        assert deserialized.key == original.key
+        assert deserialized.signature == original.signature
+        assert deserialized.chunk_macs == original.chunk_macs
+    
+    def test_deserialize_with_invalid_signature(self, secure_beacon):
+        """Test deserialization with invalid signature."""
+        original, signature_manager, integrity_manager = secure_beacon
+        
+        # Tamper with signature
+        original.signature = secrets.token_bytes(64)
+        
+        serialized = original.serialize()
+        
+        # Should raise SecurityError
+        with pytest.raises(SecurityError):
+            Beacon.deserialize(
+                serialized,
+                signature_manager=signature_manager,
+                integrity_manager=integrity_manager
+            )
+    
+    def test_deserialize_malformed_data(self):
+        """Test deserialization of malformed data."""
+        malformed_data = b"not_a_beacon"
+        
+        with pytest.raises(ValueError):
+            Beacon.deserialize(malformed_data)
+
+
+class TestFactoryFunctions:
+    """Test beacon factory functions."""
+    
+    @pytest.fixture
+    def signature_manager(self):
+        """Create a signature manager."""
+        audit_logger = Mock(spec=AuditLogger)
+        manager = SignatureKeyManager(audit_logger=audit_logger)
+        key_id = manager.generate_signing_key()
+        manager.default_key_id = key_id
+        return manager
+    
+    @pytest.fixture
+    def integrity_manager(self):
+        """Create an integrity manager."""
+        mac_key = secrets.token_bytes(32)
+        audit_logger = Mock(spec=AuditLogger)
+        return IntegrityManager(mac_key=mac_key, audit_logger=audit_logger)
+    
+    def test_create_signed_beacon(self, signature_manager):
+        """Test signed beacon factory function."""
+        beacon = create_signed_beacon(
+            key="factory_signed",
+            primes=[2, 3, 5],
+            phase_angles=[1.0, 2.0, 3.0],
+            signature_manager=signature_manager,
+            node_id="factory_node"
+        )
+        
+        assert isinstance(beacon, Beacon)
+        assert beacon.signature is not None
+        assert beacon.signer_key_id is not None
+        assert beacon.chunk_macs is None  # No integrity manager
+        assert beacon.node_id == "factory_node"
+    
+    def test_create_secure_beacon(self, signature_manager, integrity_manager):
+        """Test secure beacon factory function."""
+        beacon = create_secure_beacon(
+            key="factory_secure",
+            primes=[2, 3, 5, 7],
+            phase_angles=[1.0, 2.0, 3.0, 4.0],
+            signature_manager=signature_manager,
+            integrity_manager=integrity_manager,
+            node_id="secure_factory_node"
+        )
+        
+        assert isinstance(beacon, Beacon)
+        assert beacon.signature is not None
+        assert beacon.signer_key_id is not None
+        assert beacon.chunk_macs is not None
+        assert len(beacon.chunk_macs) == 4
+        assert beacon.node_id == "secure_factory_node"
+
+
+class TestBeaconIntegration:
+    """Integration tests for beacon with ResonaGraph components."""
+    
+    def test_beacon_with_real_prime_selection(self):
+        """Test beacon with actual prime selection logic."""
+        # This would integrate with the actual prime selection module
+        # For now, use realistic prime values
+        primes = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29]
+        phase_angles = [i * 0.1 for i in range(len(primes))]
+        
+        beacon = Beacon(
+            key="integration_beacon",
+            primes=primes,
+            phase_angles=phase_angles
+        )
+        
+        assert len(beacon.primes) == len(beacon.phase_angles)
+        assert beacon.phase_fingerprint != 0
+    
+    def test_beacon_with_performance_constraints(self):
+        """Test beacon performance with realistic constraints."""
+        import time
+        
+        # Test beacon creation performance
+        start_time = time.time()
+        
+        for i in range(100):
+            beacon = Beacon(
+                key=f"perf_beacon_{i}",
+                primes=[2, 3, 5, 7],
+                phase_angles=[1.0, 2.0, 3.0, 4.0]
+            )
+        
+        creation_time = time.time() - start_time
+        
+        # Should create 100 beacons in reasonable time (< 1 second)
+        assert creation_time < 1.0
+        
+        # Test with security enabled
+        audit_logger = Mock(spec=AuditLogger)
+        signature_manager = SignatureKeyManager(audit_logger=audit_logger)
+        signature_manager.generate_signing_key()
+        
+        start_time = time.time()
+        
+        for i in range(10):  # Fewer iterations for signed beacons
+            beacon = Beacon(
+                key=f"secure_perf_beacon_{i}",
+                primes=[2, 3, 5, 7],
+                phase_angles=[1.0, 2.0, 3.0, 4.0],
+                signature_manager=signature_manager
+            )
+        
+        secure_creation_time = time.time() - start_time
+        
+        # Should still be reasonable (< 1 second for 10 signed beacons)
+        assert secure_creation_time < 1.0
+    
+    def test_beacon_size_constraints(self):
+        """Test beacon size constraints for network transmission."""
+        # Test basic beacon size
+        beacon = Beacon(
+            key="size_test",
+            primes=[2, 3, 5, 7, 11],
+            phase_angles=[1.0, 2.0, 3.0, 4.0, 5.0]
+        )
+        
+        basic_size = beacon.size()
+        
+        # Should be reasonable for network transmission (< 1KB)
+        assert basic_size < 1024
+        
+        # Test with security
+        audit_logger = Mock(spec=AuditLogger)
+        signature_manager = SignatureKeyManager(audit_logger=audit_logger)
+        signature_manager.generate_signing_key()
+        
+        mac_key = secrets.token_bytes(32)
+        integrity_manager = IntegrityManager(mac_key=mac_key, audit_logger=audit_logger)
+        
+        secure_beacon = Beacon(
+            key="secure_size_test",
+            primes=[2, 3, 5, 7, 11],
+            phase_angles=[1.0, 2.0, 3.0, 4.0, 5.0],
+            signature_manager=signature_manager,
+            integrity_manager=integrity_manager,
+            node_id="size_test_node"
+        )
+        
+        secure_size = secure_beacon.size()
+        
+        # Should still be reasonable even with security (< 2KB)
+        assert secure_size < 2048
+        assert secure_size > basic_size  # But larger than basic

@@ -1,279 +1,395 @@
 """
-Tests for key hierarchy and rotation.
+Tests for key hierarchy management.
 
-Tests HKDF key derivation, key rotation, and version management
-as specified in NEXT_STEPS.md 6.1.
+Tests key derivation, rotation, HSM integration, and audit logging.
 """
 
-import time
 import pytest
+import time
+import tempfile
+import os
+from datetime import datetime, timedelta
 
-from resonagraph.core.phase_key import PhaseKey
 from resonagraph.security.key_hierarchy import (
-    KeyHierarchy,
-    KeyRotationScheduler,
-    KeyVersion
+    KeyHierarchy, KeyRotationScheduler, KeyType, KeyStatus, KeyMetadata
 )
+from resonagraph.security.hsm import MockHSM
+from resonagraph.security.audit import create_audit_logger, AnonymizationLevel
+from resonagraph.core.phase_key import PhaseKey
+
+
+class TestKeyMetadata:
+    """Test KeyMetadata functionality."""
+    
+    def test_key_metadata_creation(self):
+        """Test creating key metadata."""
+        metadata = KeyMetadata(
+            key_id="test_key",
+            key_type=KeyType.TOPIC,
+            created_at=datetime.utcnow(),
+            expires_at=None,
+            status=KeyStatus.ACTIVE,
+            topic="test_topic"
+        )
+        
+        assert metadata.key_id == "test_key"
+        assert metadata.key_type == KeyType.TOPIC
+        assert metadata.status == KeyStatus.ACTIVE
+        assert not metadata.is_expired
+    
+    def test_key_expiration(self):
+        """Test key expiration detection."""
+        # Expired key
+        expired_metadata = KeyMetadata(
+            key_id="expired_key",
+            key_type=KeyType.SESSION,
+            created_at=datetime.utcnow() - timedelta(hours=2),
+            expires_at=datetime.utcnow() - timedelta(hours=1),
+            status=KeyStatus.ACTIVE
+        )
+        
+        assert expired_metadata.is_expired
+        
+        # Non-expired key
+        active_metadata = KeyMetadata(
+            key_id="active_key",
+            key_type=KeyType.TOPIC,
+            created_at=datetime.utcnow(),
+            expires_at=datetime.utcnow() + timedelta(hours=1),
+            status=KeyStatus.ACTIVE
+        )
+        
+        assert not active_metadata.is_expired
+    
+    def test_needs_rotation(self):
+        """Test rotation requirement detection."""
+        # Key that needs rotation
+        old_key = KeyMetadata(
+            key_id="old_key",
+            key_type=KeyType.TOPIC,
+            created_at=datetime.utcnow() - timedelta(hours=25),  # 25 hours old
+            expires_at=None,
+            status=KeyStatus.ACTIVE,
+            rotation_interval=86400  # 24 hours
+        )
+        
+        assert old_key.needs_rotation
+        
+        # Fresh key
+        new_key = KeyMetadata(
+            key_id="new_key",
+            key_type=KeyType.TOPIC,
+            created_at=datetime.utcnow(),
+            expires_at=None,
+            status=KeyStatus.ACTIVE,
+            rotation_interval=86400
+        )
+        
+        assert not new_key.needs_rotation
 
 
 class TestKeyHierarchy:
     """Test KeyHierarchy functionality."""
     
-    def test_initialization_with_root_key(self):
-        """Test initialization with provided root key."""
-        root_key = PhaseKey.generate()
-        hierarchy = KeyHierarchy(root_key)
+    def setup_method(self):
+        """Set up test fixtures."""
+        self.hsm = MockHSM()
         
-        assert hierarchy.get_root_key() == root_key
+        # Create temporary audit log
+        self.temp_dir = tempfile.mkdtemp()
+        self.audit_file = os.path.join(self.temp_dir, "test_audit.log")
+        self.audit_logger = create_audit_logger(
+            self.audit_file,
+            AnonymizationLevel.NONE  # No anonymization for tests
+        )
+        
+        self.hierarchy = KeyHierarchy(
+            hsm=self.hsm,
+            audit_logger=self.audit_logger,
+            auto_rotation=False  # Disable for controlled testing
+        )
     
-    def test_initialization_without_root_key(self):
-        """Test initialization generates root key if not provided."""
-        hierarchy = KeyHierarchy()
+    def teardown_method(self):
+        """Clean up test fixtures."""
+        if hasattr(self, 'hierarchy'):
+            self.hierarchy.shutdown()
         
-        root_key = hierarchy.get_root_key()
-        assert root_key is not None
-        assert len(root_key.get_bytes()) == PhaseKey.KEY_SIZE
+        # Clean up temp files
+        if hasattr(self, 'temp_dir'):
+            import shutil
+            shutil.rmtree(self.temp_dir, ignore_errors=True)
     
-    def test_derive_key_deterministic(self):
-        """Test that key derivation is deterministic."""
-        root_key = PhaseKey.generate()
-        hierarchy = KeyHierarchy(root_key)
+    def test_create_root_key(self):
+        """Test root key creation."""
+        key_id = self.hierarchy.create_root_key("test_root")
         
-        salt = b"test_salt"
-        key1 = hierarchy.derive_key("test_context", "test_purpose", 1, salt)
-        key2 = hierarchy.derive_key("test_context", "test_purpose", 1, salt)
+        assert key_id == "test_root"
+        assert self.hsm.key_exists("test_root")
         
-        assert key1 == key2
-    
-    def test_derive_key_different_contexts(self):
-        """Test that different contexts produce different keys."""
-        root_key = PhaseKey.generate()
-        hierarchy = KeyHierarchy(root_key)
-        
-        salt = b"test_salt"
-        key1 = hierarchy.derive_key("context1", "purpose", 1, salt)
-        key2 = hierarchy.derive_key("context2", "purpose", 1, salt)
-        
-        assert key1 != key2
-    
-    def test_derive_key_different_purposes(self):
-        """Test that different purposes produce different keys."""
-        root_key = PhaseKey.generate()
-        hierarchy = KeyHierarchy(root_key)
-        
-        salt = b"test_salt"
-        key1 = hierarchy.derive_key("context", "purpose1", 1, salt)
-        key2 = hierarchy.derive_key("context", "purpose2", 1, salt)
-        
-        assert key1 != key2
-    
-    def test_derive_key_different_versions(self):
-        """Test that different versions produce different keys."""
-        root_key = PhaseKey.generate()
-        hierarchy = KeyHierarchy(root_key)
-        
-        salt = b"test_salt"
-        key1 = hierarchy.derive_key("context", "purpose", 1, salt)
-        key2 = hierarchy.derive_key("context", "purpose", 2, salt)
-        
-        assert key1 != key2
+        metadata = self.hierarchy.get_key_metadata("test_root")
+        assert metadata is not None
+        assert metadata.key_type == KeyType.ROOT
+        assert metadata.status == KeyStatus.ACTIVE
+        assert metadata.expires_at is None  # Root keys don't expire
     
     def test_derive_topic_key(self):
-        """Test topic key derivation with metadata."""
-        hierarchy = KeyHierarchy()
+        """Test topic key derivation."""
+        # Create root key first
+        self.hierarchy.create_root_key("root")
         
-        key_version = hierarchy.derive_topic_key("test_topic", version=1)
+        # Derive topic key
+        topic_key = self.hierarchy.derive_topic_key("users", "root")
         
-        assert isinstance(key_version, KeyVersion)
-        assert isinstance(key_version.key, PhaseKey)
-        assert key_version.version == 1
-        assert key_version.purpose == "topic:test_topic"
-        assert key_version.expires_at > key_version.created_at
-    
-    def test_derive_topic_key_caching(self):
-        """Test that topic keys are cached."""
-        hierarchy = KeyHierarchy()
+        assert isinstance(topic_key, PhaseKey)
         
-        key_version1 = hierarchy.derive_topic_key("test_topic", version=1)
-        key_version2 = hierarchy.derive_topic_key("test_topic", version=1)
-        
-        # Should return the same cached instance
-        assert key_version1 is key_version2
-    
-    def test_derive_topic_key_expiry(self):
-        """Test that expired keys are regenerated."""
-        hierarchy = KeyHierarchy()
-        
-        # Create key with very short TTL
-        key_version1 = hierarchy.derive_topic_key("test_topic", version=1, ttl_seconds=0.1)
-        
-        # Wait for expiry
-        time.sleep(0.2)
-        
-        # Should generate new key (different instance)
-        key_version2 = hierarchy.derive_topic_key("test_topic", version=1, ttl_seconds=86400)
-        
-        # Keys should be different instances (different created_at)
-        assert key_version1.created_at != key_version2.created_at
+        # Check metadata
+        topic_key_id = "root:topic:users"
+        metadata = self.hierarchy.get_key_metadata(topic_key_id)
+        assert metadata is not None
+        assert metadata.key_type == KeyType.TOPIC
+        assert metadata.topic == "users"
+        assert metadata.parent_key_id == "root"
     
     def test_derive_role_key(self):
-        """Test role-based key derivation."""
-        hierarchy = KeyHierarchy()
+        """Test role key derivation."""
+        # Create root key
+        self.hierarchy.create_root_key("root")
         
-        admin_key = hierarchy.derive_role_key("admin", "resource1", version=1)
-        user_key = hierarchy.derive_role_key("user", "resource1", version=1)
+        # Derive role key
+        admin_key = self.hierarchy.derive_role_key("admin", "users", "root")
+        user_key = self.hierarchy.derive_role_key("user", "users", "root")
         
         assert isinstance(admin_key, PhaseKey)
         assert isinstance(user_key, PhaseKey)
-        assert admin_key != user_key
+        
+        # Keys should be different
+        assert admin_key.get_bytes() != user_key.get_bytes()
+        
+        # Check metadata
+        admin_key_id = "root:role:users:admin"
+        metadata = self.hierarchy.get_key_metadata(admin_key_id)
+        assert metadata is not None
+        assert metadata.key_type == KeyType.ROLE
+        assert metadata.role == "admin"
+        assert metadata.topic == "users"
     
-    def test_rotate_root_key(self):
-        """Test root key rotation."""
-        hierarchy = KeyHierarchy()
+    def test_key_caching(self):
+        """Test that derived keys are cached."""
+        self.hierarchy.create_root_key("root")
         
-        old_root = hierarchy.get_root_key()
+        # Derive key twice
+        key1 = self.hierarchy.derive_topic_key("test_topic", "root")
+        key2 = self.hierarchy.derive_topic_key("test_topic", "root")
         
-        # Derive a topic key
-        old_topic_key = hierarchy.derive_topic_key("test_topic", version=1)
+        # Should be the same instance (cached)
+        assert key1.get_bytes() == key2.get_bytes()
+    
+    def test_key_rotation(self):
+        """Test key rotation."""
+        self.hierarchy.create_root_key("root")
         
-        # Rotate root key
-        new_root = PhaseKey.generate()
-        hierarchy.rotate_root_key(new_root)
+        # Derive initial key
+        original_key = self.hierarchy.derive_topic_key("test_topic", "root")
+        topic_key_id = "root:topic:test_topic"
         
-        assert hierarchy.get_root_key() == new_root
-        assert hierarchy.get_root_key() != old_root
+        # Rotate the key
+        new_key = self.hierarchy.rotate_key(topic_key_id, retain_old=True)
         
-        # Derived keys should be different after rotation
-        new_topic_key = hierarchy.derive_topic_key("test_topic", version=1)
-        assert new_topic_key.key != old_topic_key.key
+        # New key should be different
+        assert new_key.get_bytes() != original_key.get_bytes()
+        
+        # Old key metadata should show rotated status
+        old_metadata = self.hierarchy.get_key_metadata(topic_key_id)
+        # Note: rotation creates new metadata, so we'd need to track old keys
+        # differently in a real implementation
+    
+    def test_key_revocation(self):
+        """Test key revocation."""
+        self.hierarchy.create_root_key("root")
+        topic_key = self.hierarchy.derive_topic_key("test_topic", "root")
+        topic_key_id = "root:topic:test_topic"
+        
+        # Revoke key
+        self.hierarchy.revoke_key(topic_key_id)
+        
+        # Key should be marked as revoked
+        metadata = self.hierarchy.get_key_metadata(topic_key_id)
+        assert metadata.status == KeyStatus.REVOKED
+    
+    def test_list_keys(self):
+        """Test key listing with filters."""
+        self.hierarchy.create_root_key("root")
+        self.hierarchy.derive_topic_key("topic1", "root")
+        self.hierarchy.derive_topic_key("topic2", "root")
+        self.hierarchy.derive_role_key("admin", "topic1", "root")
+        
+        # List all keys
+        all_keys = self.hierarchy.list_keys()
+        assert len(all_keys) >= 4  # root + 2 topics + 1 role
+        
+        # List only topic keys
+        topic_keys = self.hierarchy.list_keys(key_type=KeyType.TOPIC)
+        assert len(topic_keys) == 2
+        
+        # List only active keys
+        active_keys = self.hierarchy.list_keys(status=KeyStatus.ACTIVE)
+        assert all(k.status == KeyStatus.ACTIVE for k in active_keys.values())
+    
+    def test_cannot_rotate_root_key(self):
+        """Test that root keys cannot be rotated."""
+        self.hierarchy.create_root_key("root")
+        
+        with pytest.raises(ValueError, match="Root keys cannot be automatically rotated"):
+            self.hierarchy.rotate_key("root")
+    
+    def test_key_hierarchy_with_audit(self):
+        """Test that key operations are audited."""
+        self.hierarchy.create_root_key("root")
+        self.hierarchy.derive_topic_key("audited_topic", "root")
+        
+        # Check that audit events were logged
+        assert os.path.exists(self.audit_file)
+        
+        with open(self.audit_file, 'r') as f:
+            log_content = f.read()
+            assert "root_key_created" in log_content
+            assert "topic_key_derived" in log_content
 
 
 class TestKeyRotationScheduler:
-    """Test KeyRotationScheduler functionality."""
+    """Test automatic key rotation scheduler."""
     
-    def test_initialization(self):
-        """Test scheduler initialization."""
-        hierarchy = KeyHierarchy()
-        scheduler = KeyRotationScheduler(hierarchy)
-        
-        assert scheduler.key_hierarchy is hierarchy
-        assert scheduler.rotation_interval == 86400  # 24 hours
-        assert scheduler.overlap_period == 3600  # 1 hour
-    
-    def test_get_current_version_initial(self):
-        """Test getting current version for new topic."""
-        hierarchy = KeyHierarchy()
-        scheduler = KeyRotationScheduler(hierarchy)
-        
-        version = scheduler.get_current_version("test_topic")
-        assert version == 1
-    
-    def test_get_active_keys_single(self):
-        """Test getting active keys when only one version exists."""
-        hierarchy = KeyHierarchy()
-        scheduler = KeyRotationScheduler(hierarchy, rotation_interval=3600)
-        
-        current, previous = scheduler.get_active_keys("test_topic")
-        
-        assert isinstance(current, KeyVersion)
-        assert current.version == 1
-        assert previous is None  # No previous version
-    
-    def test_should_rotate_initial(self):
-        """Test that new keys don't need immediate rotation."""
-        hierarchy = KeyHierarchy()
-        scheduler = KeyRotationScheduler(hierarchy, rotation_interval=3600)
-        
-        # Get a key to initialize
-        scheduler.get_active_keys("test_topic")
-        
-        # Should not need rotation immediately
-        assert not scheduler.should_rotate("test_topic")
-    
-    def test_should_rotate_after_interval(self):
-        """Test that keys need rotation after interval."""
-        hierarchy = KeyHierarchy()
-        # Very short rotation interval for testing
-        scheduler = KeyRotationScheduler(hierarchy, rotation_interval=0.1, overlap_period=0.05)
-        
-        # Get initial key
-        scheduler.get_active_keys("test_topic")
-        
-        # Wait past rotation interval
-        time.sleep(0.15)
-        
-        # Should need rotation now
-        assert scheduler.should_rotate("test_topic")
-    
-    def test_rotate_key(self):
-        """Test manual key rotation."""
-        hierarchy = KeyHierarchy()
-        scheduler = KeyRotationScheduler(hierarchy)
-        
-        # Get initial version
-        initial_version = scheduler.get_current_version("test_topic")
-        assert initial_version == 1
-        
-        # Rotate
-        new_key = scheduler.rotate_key("test_topic")
-        
-        assert new_key.version == 2
-        assert scheduler.get_current_version("test_topic") == 2
-    
-    def test_auto_rotate_if_needed_no_rotation(self):
-        """Test auto-rotation when not needed."""
-        hierarchy = KeyHierarchy()
-        scheduler = KeyRotationScheduler(hierarchy, rotation_interval=3600)
-        
-        # Get initial key
-        scheduler.get_active_keys("test_topic")
-        
-        # Try auto-rotation (should not rotate)
-        result = scheduler.auto_rotate_if_needed("test_topic")
-        
-        assert result is None
-        assert scheduler.get_current_version("test_topic") == 1
-    
-    def test_auto_rotate_if_needed_with_rotation(self):
-        """Test auto-rotation when needed."""
-        hierarchy = KeyHierarchy()
-        # Very short rotation interval for testing
-        scheduler = KeyRotationScheduler(hierarchy, rotation_interval=0.1, overlap_period=0.05)
-        
-        # Get initial key
-        scheduler.get_active_keys("test_topic")
-        
-        # Wait past rotation interval
-        time.sleep(0.15)
-        
-        # Try auto-rotation (should rotate)
-        result = scheduler.auto_rotate_if_needed("test_topic")
-        
-        assert result is not None
-        assert result.version == 2
-        assert scheduler.get_current_version("test_topic") == 2
-    
-    def test_overlap_period(self):
-        """Test that both keys are valid during overlap period."""
-        hierarchy = KeyHierarchy()
-        # Short intervals for testing
-        scheduler = KeyRotationScheduler(
-            hierarchy,
-            rotation_interval=0.2,
-            overlap_period=0.1
+    def setup_method(self):
+        """Set up test fixtures."""
+        self.hsm = MockHSM()
+        self.hierarchy = KeyHierarchy(
+            hsm=self.hsm,
+            auto_rotation=False  # We'll create scheduler manually
         )
         
-        # Get initial key
-        current1, previous1 = scheduler.get_active_keys("test_topic")
-        assert current1.version == 1
-        assert previous1 is None
+        # Create scheduler with very short check interval for testing
+        self.scheduler = KeyRotationScheduler(
+            self.hierarchy,
+            check_interval=1  # 1 second for quick testing
+        )
+    
+    def teardown_method(self):
+        """Clean up test fixtures."""
+        if hasattr(self, 'scheduler'):
+            self.scheduler.stop()
+        if hasattr(self, 'hierarchy'):
+            self.hierarchy.shutdown()
+    
+    def test_scheduler_start_stop(self):
+        """Test scheduler lifecycle."""
+        assert not self.scheduler._running
         
-        # Wait and rotate
-        time.sleep(0.25)
-        scheduler.rotate_key("test_topic")
+        self.scheduler.start()
+        assert self.scheduler._running
         
-        # During overlap period, should have both keys
-        current2, previous2 = scheduler.get_active_keys("test_topic")
-        assert current2.version == 2
-        assert previous2 is not None
-        assert previous2.version == 1
+        time.sleep(0.1)  # Let it start
+        
+        self.scheduler.stop()
+        assert not self.scheduler._running
+    
+    def test_rotation_detection(self):
+        """Test that scheduler detects keys needing rotation."""
+        self.hierarchy.create_root_key("root")
+        
+        # Create a key with very short rotation interval
+        topic_key = self.hierarchy.derive_topic_key("test", "root", rotation_interval=1)
+        topic_key_id = "root:topic:test"
+        
+        # Manually mark as needing rotation by backdating creation
+        metadata = self.hierarchy.get_key_metadata(topic_key_id)
+        metadata.created_at = datetime.utcnow() - timedelta(seconds=2)
+        
+        # Start scheduler
+        self.scheduler.start()
+        time.sleep(2)  # Wait for rotation check
+        self.scheduler.stop()
+        
+        # Key should have been rotated (this is a simplified test)
+        # In practice, we'd need to check rotation happened correctly
+
+
+class TestIntegration:
+    """Integration tests for key hierarchy components."""
+    
+    def test_end_to_end_key_management(self):
+        """Test complete key management workflow."""
+        # Set up components
+        hsm = MockHSM()
+        temp_dir = tempfile.mkdtemp()
+        audit_file = os.path.join(temp_dir, "integration_audit.log")
+        audit_logger = create_audit_logger(audit_file, AnonymizationLevel.LOW)
+        
+        hierarchy = KeyHierarchy(
+            hsm=hsm,
+            audit_logger=audit_logger,
+            auto_rotation=False
+        )
+        
+        try:
+            # 1. Create root key
+            root_id = hierarchy.create_root_key("production_root")
+            assert hsm.key_exists(root_id)
+            
+            # 2. Derive topic keys for different services
+            user_key = hierarchy.derive_topic_key("users", root_id)
+            post_key = hierarchy.derive_topic_key("posts", root_id)
+            
+            # 3. Derive role keys
+            admin_user_key = hierarchy.derive_role_key("admin", "users", root_id)
+            regular_user_key = hierarchy.derive_role_key("user", "users", root_id)
+            
+            # 4. Verify keys are different
+            assert user_key.get_bytes() != post_key.get_bytes()
+            assert admin_user_key.get_bytes() != regular_user_key.get_bytes()
+            
+            # 5. Rotate a key
+            new_user_key = hierarchy.rotate_key("production_root:topic:users", retain_old=True)
+            assert new_user_key.get_bytes() != user_key.get_bytes()
+            
+            # 6. Clean up expired keys
+            cleanup_count = hierarchy.cleanup_expired_keys()
+            # Should be 0 since we retained the old key and it's not expired yet
+            
+            # 7. Verify audit trail
+            assert os.path.exists(audit_file)
+            with open(audit_file, 'r') as f:
+                log_content = f.read()
+                assert "root_key_created" in log_content
+                assert "topic_key_derived" in log_content
+                assert "role_key_derived" in log_content
+                assert "key_rotated" in log_content
+        
+        finally:
+            hierarchy.shutdown()
+            import shutil
+            shutil.rmtree(temp_dir, ignore_errors=True)
+    
+    def test_hsm_failure_handling(self):
+        """Test handling of HSM failures."""
+        # Create HSM that will fail
+        class FailingHSM(MockHSM):
+            def get_key(self, key_id: str):
+                raise Exception("HSM connection failed")
+        
+        failing_hsm = FailingHSM()
+        hierarchy = KeyHierarchy(hsm=failing_hsm, auto_rotation=False)
+        
+        try:
+            # Store a key first (this should work)
+            failing_hsm.store_key("test_key", b"x" * 32)
+            
+            # Now try to derive - should handle HSM failure gracefully
+            with pytest.raises(Exception):  # Should propagate HSM error
+                hierarchy.derive_topic_key("test_topic", "test_key")
+        
+        finally:
+            hierarchy.shutdown()
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

@@ -1,397 +1,594 @@
 """
-Integrity verification and replay attack prevention.
+Data integrity verification for ResonaGraph.
 
-According to NEXT_STEPS.md 6.2:
-- Per-chunk HMAC for phase authenticity
-- MAC verification during residue extraction
-- Epoch-based replay detection
-- Nonce support for beacons
+Implements HMAC protection for phase chunks and replay attack prevention
+according to Phase 6B specifications.
 """
 
-import hashlib
 import hmac
+import hashlib
 import time
-from typing import Dict, Set, Tuple, Optional
-from collections import deque
 import threading
+from typing import Dict, List, Optional, Set, Any, Tuple
+from dataclasses import dataclass
+from enum import Enum
+from collections import defaultdict, deque
+
+from resonagraph.security.audit import AuditLogger, AuditEvent, AuditEventType
 
 
-class PhaseMAC:
-    """
-    Manages HMAC-SHA256 for phase chunk authenticity.
-    
-    According to NEXT_STEPS.md 6.2:
-    - HMAC-SHA256 for each phase chunk
-    - Include chunk index and prime in MAC
-    - Batch MAC verification for performance
-    """
-    
-    @staticmethod
-    def compute_chunk_mac(
-        chunk_data: bytes,
-        chunk_index: int,
-        prime: int,
-        key: bytes
-    ) -> bytes:
-        """
-        Compute HMAC-SHA256 for a phase chunk.
-        
-        According to copilot-instructions.md:
-        - Per-chunk HMAC for phase authenticity
-        - Include chunk index and prime in MAC
-        
-        Args:
-            chunk_data: Phase chunk data
-            chunk_index: Index of this chunk
-            prime: Prime number associated with chunk
-            key: HMAC key
-            
-        Returns:
-            32-byte HMAC-SHA256
-        """
-        # Build message: chunk_data || chunk_index || prime
-        message = chunk_data + chunk_index.to_bytes(4, 'big') + prime.to_bytes(8, 'big')
-        return hmac.new(key, message, hashlib.sha256).digest()
-    
-    @staticmethod
-    def verify_chunk_mac(
-        chunk_data: bytes,
-        chunk_index: int,
-        prime: int,
-        expected_mac: bytes,
-        key: bytes
-    ) -> bool:
-        """
-        Verify HMAC-SHA256 for a phase chunk.
-        
-        Args:
-            chunk_data: Phase chunk data
-            chunk_index: Index of this chunk
-            prime: Prime number associated with chunk
-            expected_mac: Expected MAC value
-            key: HMAC key
-            
-        Returns:
-            True if MAC is valid
-        """
-        computed_mac = PhaseMAC.compute_chunk_mac(chunk_data, chunk_index, prime, key)
-        return hmac.compare_digest(computed_mac, expected_mac)
-    
-    @staticmethod
-    def batch_verify_macs(
-        chunks: list[Tuple[bytes, int, int, bytes]],
-        key: bytes
-    ) -> bool:
-        """
-        Verify multiple MACs efficiently.
-        
-        According to NEXT_STEPS.md 6.2:
-        - Batch MAC verification for performance
-        
-        Args:
-            chunks: List of (chunk_data, chunk_index, prime, expected_mac) tuples
-            key: HMAC key
-            
-        Returns:
-            True if all MACs are valid
-        """
-        for chunk_data, chunk_index, prime, expected_mac in chunks:
-            if not PhaseMAC.verify_chunk_mac(chunk_data, chunk_index, prime, expected_mac, key):
-                return False
-        return True
+class IntegrityError(Exception):
+    """Base exception for integrity violations."""
+    pass
+
+
+class MACVerificationError(IntegrityError):
+    """Raised when MAC verification fails."""
+    pass
+
+
+class ReplayAttackError(IntegrityError):
+    """Raised when a replay attack is detected."""
+    pass
+
+
+@dataclass
+class MACInfo:
+    """Information about a MAC-protected chunk."""
+    chunk_id: str
+    mac: bytes
+    chunk_size: int
+    created_at: float
+    algorithm: str = "HMAC-SHA256"
+
+
+@dataclass
+class EpochRecord:
+    """Record of a processed epoch for replay detection."""
+    key: str
+    epoch: float
+    first_seen: float
+    last_seen: float
+    signature_key_id: Optional[str] = None
+    node_id: Optional[str] = None
 
 
 class ReplayDetector:
     """
-    Prevents replay attacks using epoch and nonce tracking.
+    Detects and prevents replay attacks using epoch tracking.
     
-    According to NEXT_STEPS.md 6.2:
-    - Track processed epochs per key
-    - Reject beacons with old epochs
-    - Sliding window for acceptable epochs
-    - Nonce tracking to prevent replay
+    Maintains a sliding window of processed epochs per key to detect
+    attempts to replay old beacons.
     """
     
     def __init__(
         self,
-        epoch_window: int = 10,
-        max_nonces_per_key: int = 10000
+        window_size: int = 10,  # Number of epochs to track
+        max_age: int = 300,     # Maximum age in seconds
+        audit_logger: Optional[AuditLogger] = None
     ):
         """
         Initialize replay detector.
         
         Args:
-            epoch_window: Number of epochs to accept (default 10)
-            max_nonces_per_key: Maximum nonces to track per key
+            window_size: Number of epochs to track per key
+            max_age: Maximum age of epochs to accept (seconds)
+            audit_logger: Audit logger for replay events
         """
-        self.epoch_window = epoch_window
-        self.max_nonces_per_key = max_nonces_per_key
+        self.window_size = window_size
+        self.max_age = max_age
+        self.audit_logger = audit_logger
         
         # Track processed epochs per key
-        self._processed_epochs: Dict[str, Set[int]] = {}
+        self._epoch_windows: Dict[str, deque] = defaultdict(lambda: deque(maxlen=window_size))
+        self._epoch_records: Dict[Tuple[str, float], EpochRecord] = {}
         
-        # Track nonces per key (using deque for bounded memory)
-        self._nonces: Dict[str, deque] = {}
+        # Thread safety
+        self._lock = threading.RLock()
         
-        # Lock for thread safety
-        self._lock = threading.Lock()
+        # Statistics
+        self.stats = {
+            'epochs_processed': 0,
+            'replay_attempts_blocked': 0,
+            'expired_epochs_rejected': 0,
+            'duplicate_epochs_detected': 0
+        }
     
-    def check_epoch(self, key: str, epoch: int, current_epoch: int) -> bool:
+    def check_epoch(
+        self,
+        key: str,
+        epoch: float,
+        signature_key_id: Optional[str] = None,
+        node_id: Optional[str] = None
+    ) -> bool:
         """
-        Check if an epoch is valid (not too old, not in future).
-        
-        According to NEXT_STEPS.md 6.2:
-        - Reject beacons with old epochs
-        - Sliding window for acceptable epochs
+        Check if an epoch is valid (not a replay).
         
         Args:
-            key: Beacon key
-            epoch: Epoch to check
-            current_epoch: Current epoch number
+            key: Key associated with the epoch
+            epoch: Epoch timestamp
+            signature_key_id: Optional signing key ID
+            node_id: Optional node ID that created the epoch
             
         Returns:
-            True if epoch is acceptable
-        """
-        # Check if epoch is within acceptable window
-        min_epoch = current_epoch - self.epoch_window
-        max_epoch = current_epoch + 1  # Allow 1 epoch in future for clock skew
-        
-        if epoch < min_epoch or epoch > max_epoch:
-            return False
-        
-        # Check if we've already processed this epoch for this key
-        with self._lock:
-            if key in self._processed_epochs:
-                if epoch in self._processed_epochs[key]:
-                    # Duplicate epoch - likely replay
-                    return False
-        
-        return True
-    
-    def mark_epoch_processed(self, key: str, epoch: int) -> None:
-        """
-        Mark an epoch as processed for a key.
-        
-        Args:
-            key: Beacon key
-            epoch: Epoch number
+            True if epoch is valid
+            
+        Raises:
+            ReplayAttackError: If replay is detected
         """
         with self._lock:
-            if key not in self._processed_epochs:
-                self._processed_epochs[key] = set()
+            current_time = time.time()
             
-            self._processed_epochs[key].add(epoch)
+            # Check if epoch is too old
+            if current_time - epoch > self.max_age:
+                self.stats['expired_epochs_rejected'] += 1
+                
+                if self.audit_logger:
+                    self.audit_logger.log_security_event(
+                        AuditEventType.REPLAY_DETECTED,
+                        key,
+                        "blocked",
+                        metadata={
+                            "reason": "expired_epoch",
+                            "epoch": epoch,
+                            "age": current_time - epoch,
+                            "max_age": self.max_age
+                        }
+                    )
+                
+                raise ReplayAttackError(f"Epoch {epoch} is too old (age: {current_time - epoch:.1f}s)")
             
-            # Clean up old epochs (keep only recent window)
-            current_epoch = epoch
-            min_epoch = current_epoch - self.epoch_window * 2  # Keep 2x window for safety
-            self._processed_epochs[key] = {
-                e for e in self._processed_epochs[key]
-                if e >= min_epoch
-            }
-    
-    def check_nonce(self, key: str, nonce: bytes) -> bool:
-        """
-        Check if a nonce has been seen before.
-        
-        According to NEXT_STEPS.md 6.2:
-        - Track nonces to prevent replay
-        - Nonce expiration policy
-        
-        Args:
-            key: Beacon key
-            nonce: Nonce value
+            # Check if we've seen this exact epoch before
+            epoch_key = (key, epoch)
+            if epoch_key in self._epoch_records:
+                existing_record = self._epoch_records[epoch_key]
+                
+                # Allow if from same node (legitimate retransmission)
+                if node_id and existing_record.node_id == node_id:
+                    existing_record.last_seen = current_time
+                    return True
+                
+                # Otherwise it's a potential replay attack
+                self.stats['duplicate_epochs_detected'] += 1
+                
+                if self.audit_logger:
+                    self.audit_logger.log_security_event(
+                        AuditEventType.REPLAY_DETECTED,
+                        key,
+                        "blocked",
+                        metadata={
+                            "reason": "duplicate_epoch",
+                            "epoch": epoch,
+                            "first_seen": existing_record.first_seen,
+                            "original_node": existing_record.node_id,
+                            "current_node": node_id
+                        }
+                    )
+                
+                raise ReplayAttackError(f"Duplicate epoch {epoch} detected for key {key}")
             
-        Returns:
-            True if nonce is new (not seen before)
-        """
-        with self._lock:
-            if key not in self._nonces:
-                self._nonces[key] = deque(maxlen=self.max_nonces_per_key)
+            # Check if epoch is significantly in the future (clock skew protection)
+            future_threshold = 60  # Allow 60 seconds of clock skew
+            if epoch > current_time + future_threshold:
+                if self.audit_logger:
+                    self.audit_logger.log_security_event(
+                        AuditEventType.REPLAY_DETECTED,
+                        key,
+                        "blocked",
+                        metadata={
+                            "reason": "future_epoch",
+                            "epoch": epoch,
+                            "current_time": current_time,
+                            "skew": epoch - current_time
+                        }
+                    )
+                
+                raise ReplayAttackError(f"Epoch {epoch} is too far in the future")
             
-            # Check if nonce exists
-            if nonce in self._nonces[key]:
-                return False  # Replay detected
+            # Record this epoch
+            record = EpochRecord(
+                key=key,
+                epoch=epoch,
+                first_seen=current_time,
+                last_seen=current_time,
+                signature_key_id=signature_key_id,
+                node_id=node_id
+            )
+            
+            self._epoch_records[epoch_key] = record
+            self._epoch_windows[key].append(epoch)
+            
+            self.stats['epochs_processed'] += 1
             
             return True
     
-    def mark_nonce_used(self, key: str, nonce: bytes) -> None:
+    def cleanup_expired(self) -> int:
         """
-        Mark a nonce as used.
+        Clean up expired epoch records.
         
-        Args:
-            key: Beacon key
-            nonce: Nonce value
+        Returns:
+            Number of records cleaned up
         """
         with self._lock:
-            if key not in self._nonces:
-                self._nonces[key] = deque(maxlen=self.max_nonces_per_key)
+            current_time = time.time()
+            expired_keys = []
             
-            self._nonces[key].append(nonce)
+            for epoch_key, record in self._epoch_records.items():
+                if current_time - record.last_seen > self.max_age:
+                    expired_keys.append(epoch_key)
+            
+            for epoch_key in expired_keys:
+                del self._epoch_records[epoch_key]
+            
+            return len(expired_keys)
     
-    def validate_beacon(
-        self,
-        key: str,
-        epoch: int,
-        current_epoch: int,
-        nonce: Optional[bytes] = None
-    ) -> Tuple[bool, str]:
+    def get_stats(self) -> Dict[str, Any]:
+        """Get replay detector statistics."""
+        return self.stats.copy()
+    
+    def get_epoch_info(self, key: str) -> List[float]:
+        """Get processed epochs for a key."""
+        with self._lock:
+            return list(self._epoch_windows[key])
+
+
+class PhaseMAC:
+    """
+    Provides HMAC authentication for phase chunks.
+    
+    Implements per-chunk MAC verification to ensure phase data integrity
+    and authenticity.
+    """
+    
+    def __init__(self, mac_key: bytes, algorithm: str = "HMAC-SHA256"):
         """
-        Validate a beacon against replay attacks.
+        Initialize phase MAC system.
         
         Args:
-            key: Beacon key
-            epoch: Beacon epoch
-            current_epoch: Current epoch
-            nonce: Optional nonce
+            mac_key: Key for HMAC computation
+            algorithm: MAC algorithm to use
+        """
+        self.mac_key = mac_key
+        self.algorithm = algorithm
+        
+        # Choose hash function based on algorithm
+        if algorithm == "HMAC-SHA256":
+            self.hash_func = hashlib.sha256
+        elif algorithm == "HMAC-SHA512":
+            self.hash_func = hashlib.sha512
+        else:
+            raise ValueError(f"Unsupported MAC algorithm: {algorithm}")
+        
+        # Statistics
+        self.stats = {
+            'macs_computed': 0,
+            'macs_verified': 0,
+            'verification_failures': 0
+        }
+    
+    def compute_mac(
+        self,
+        chunk_data: bytes,
+        chunk_index: int,
+        prime: int,
+        additional_data: Optional[bytes] = None
+    ) -> bytes:
+        """
+        Compute MAC for a phase chunk.
+        
+        Args:
+            chunk_data: Phase chunk data
+            chunk_index: Index of the chunk
+            prime: Prime associated with the chunk
+            additional_data: Optional additional authenticated data
             
         Returns:
-            Tuple of (is_valid, reason)
+            MAC bytes
         """
-        # Check epoch
-        if not self.check_epoch(key, epoch, current_epoch):
-            return False, "Invalid epoch (too old or already processed)"
+        # Create message to authenticate
+        message = self._create_mac_message(chunk_data, chunk_index, prime, additional_data)
         
-        # Check nonce if provided
-        if nonce is not None:
-            if not self.check_nonce(key, nonce):
-                return False, "Duplicate nonce detected (replay attack)"
+        # Compute HMAC
+        mac = hmac.new(self.mac_key, message, self.hash_func).digest()
         
-        return True, "Valid"
+        self.stats['macs_computed'] += 1
+        
+        return mac
     
-    def accept_beacon(
+    def verify_mac(
         self,
-        key: str,
-        epoch: int,
-        nonce: Optional[bytes] = None
-    ) -> None:
+        chunk_data: bytes,
+        chunk_index: int,
+        prime: int,
+        expected_mac: bytes,
+        additional_data: Optional[bytes] = None
+    ) -> bool:
         """
-        Accept a beacon (mark epoch and nonce as used).
+        Verify MAC for a phase chunk.
         
         Args:
-            key: Beacon key
-            epoch: Beacon epoch
-            nonce: Optional nonce
-        """
-        self.mark_epoch_processed(key, epoch)
-        if nonce is not None:
-            self.mark_nonce_used(key, nonce)
-    
-    def cleanup_old_data(self, current_epoch: int) -> None:
-        """
-        Clean up old epoch and nonce data.
-        
-        Args:
-            current_epoch: Current epoch number
-        """
-        min_epoch = current_epoch - self.epoch_window * 2
-        
-        with self._lock:
-            # Clean up old epochs
-            for key in list(self._processed_epochs.keys()):
-                self._processed_epochs[key] = {
-                    e for e in self._processed_epochs[key]
-                    if e >= min_epoch
-                }
-                
-                # Remove empty entries
-                if not self._processed_epochs[key]:
-                    del self._processed_epochs[key]
+            chunk_data: Phase chunk data
+            chunk_index: Index of the chunk
+            prime: Prime associated with the chunk
+            expected_mac: Expected MAC value
+            additional_data: Optional additional authenticated data
             
-            # Nonces are automatically bounded by deque maxlen,
-            # so no cleanup needed
-
-
-class IntegrityVerifier:
-    """
-    Combined integrity verification system.
+        Returns:
+            True if MAC is valid
+            
+        Raises:
+            MACVerificationError: If MAC verification fails
+        """
+        try:
+            # Compute expected MAC
+            computed_mac = self.compute_mac(chunk_data, chunk_index, prime, additional_data)
+            
+            # Use constant-time comparison
+            if hmac.compare_digest(computed_mac, expected_mac):
+                self.stats['macs_verified'] += 1
+                return True
+            else:
+                self.stats['verification_failures'] += 1
+                return False
+        
+        except Exception as e:
+            self.stats['verification_failures'] += 1
+            raise MACVerificationError(f"MAC verification failed: {e}")
     
-    Integrates signature verification, MAC verification, and replay detection.
+    def batch_verify_macs(
+        self,
+        chunks: List[Tuple[bytes, int, int, bytes]],  # (data, index, prime, mac)
+        additional_data: Optional[bytes] = None
+    ) -> Tuple[bool, List[int]]:
+        """
+        Verify MACs for multiple chunks efficiently.
+        
+        Args:
+            chunks: List of (chunk_data, chunk_index, prime, expected_mac) tuples
+            additional_data: Optional additional authenticated data
+            
+        Returns:
+            (all_valid, failed_indices) tuple
+        """
+        failed_indices = []
+        
+        for i, (chunk_data, chunk_index, prime, expected_mac) in enumerate(chunks):
+            try:
+                if not self.verify_mac(chunk_data, chunk_index, prime, expected_mac, additional_data):
+                    failed_indices.append(i)
+            except MACVerificationError:
+                failed_indices.append(i)
+        
+        return len(failed_indices) == 0, failed_indices
+    
+    def _create_mac_message(
+        self,
+        chunk_data: bytes,
+        chunk_index: int,
+        prime: int,
+        additional_data: Optional[bytes]
+    ) -> bytes:
+        """
+        Create the message to be authenticated.
+        
+        Args:
+            chunk_data: Phase chunk data
+            chunk_index: Index of the chunk
+            prime: Prime associated with the chunk
+            additional_data: Optional additional data
+            
+        Returns:
+            Message bytes for MAC computation
+        """
+        # Create structured message
+        message_parts = [
+            chunk_data,
+            chunk_index.to_bytes(4, 'big'),
+            prime.to_bytes(8, 'big'),  # Primes can be large
+        ]
+        
+        if additional_data:
+            message_parts.append(additional_data)
+        
+        return b''.join(message_parts)
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get MAC statistics."""
+        return self.stats.copy()
+
+
+class IntegrityManager:
+    """
+    High-level integrity management for ResonaGraph.
+    
+    Coordinates replay detection and MAC verification for comprehensive
+    data integrity protection.
     """
     
     def __init__(
         self,
-        signature_key_manager,
-        replay_detector: Optional[ReplayDetector] = None
+        mac_key: bytes,
+        audit_logger: Optional[AuditLogger] = None,
+        replay_window_size: int = 10,
+        replay_max_age: int = 300
     ):
         """
-        Initialize integrity verifier.
+        Initialize integrity manager.
         
         Args:
-            signature_key_manager: SignatureKeyManager instance
-            replay_detector: Optional ReplayDetector (created if not provided)
+            mac_key: Key for MAC computation
+            audit_logger: Audit logger for integrity events
+            replay_window_size: Replay detection window size
+            replay_max_age: Maximum age for replay detection
         """
-        self.signature_key_manager = signature_key_manager
-        self.replay_detector = replay_detector or ReplayDetector()
+        self.mac_system = PhaseMAC(mac_key)
+        self.replay_detector = ReplayDetector(
+            window_size=replay_window_size,
+            max_age=replay_max_age,
+            audit_logger=audit_logger
+        )
+        self.audit_logger = audit_logger
+        
+        # Combined statistics
+        self.stats = {
+            'integrity_checks': 0,
+            'integrity_violations': 0,
+            'replay_attacks_blocked': 0,
+            'mac_failures': 0
+        }
     
     def verify_beacon_integrity(
         self,
-        payload: bytes,
-        signature: bytes,
-        mac: bytes,
-        key: str,
-        epoch: int,
-        current_epoch: int,
-        key_id: Optional[str] = None,
-        mac_key: Optional[bytes] = None,
-        nonce: Optional[bytes] = None
-    ) -> Tuple[bool, str]:
+        beacon_key: str,
+        epoch: float,
+        phase_chunks: List[Tuple[bytes, int, int]],  # (data, index, prime)
+        chunk_macs: List[bytes],
+        node_id: Optional[str] = None,
+        signature_key_id: Optional[str] = None
+    ) -> bool:
         """
-        Verify complete beacon integrity.
-        
-        According to NEXT_STEPS.md 6.2:
-        - Verify beacon signatures before processing
-        - Verify MACs during residue extraction
-        - Check for replay attacks
+        Verify complete beacon integrity (replay + MAC).
         
         Args:
-            payload: Beacon payload
-            signature: Ed25519 signature
-            mac: HMAC-SHA256
-            key: Beacon key
+            beacon_key: Beacon key
             epoch: Beacon epoch
-            current_epoch: Current epoch
-            key_id: Optional signature key ID
-            mac_key: Optional MAC key
-            nonce: Optional nonce
+            phase_chunks: List of (chunk_data, chunk_index, prime) tuples
+            chunk_macs: List of MAC values for chunks
+            node_id: Optional node ID
+            signature_key_id: Optional signature key ID
             
         Returns:
-            Tuple of (is_valid, reason)
+            True if beacon integrity is valid
+            
+        Raises:
+            IntegrityError: If integrity check fails
         """
-        # Check replay attack
-        replay_valid, replay_reason = self.replay_detector.validate_beacon(
-            key, epoch, current_epoch, nonce
-        )
-        if not replay_valid:
-            return False, f"Replay check failed: {replay_reason}"
+        self.stats['integrity_checks'] += 1
         
-        # Verify signature
-        sig_valid = self.signature_key_manager.verify_signature(
-            payload, signature, key_id=key_id
-        )
-        if not sig_valid:
-            return False, "Signature verification failed"
+        try:
+            # 1. Check for replay attacks
+            self.replay_detector.check_epoch(
+                beacon_key, epoch, signature_key_id, node_id
+            )
+            
+            # 2. Verify phase chunk MACs
+            if len(phase_chunks) != len(chunk_macs):
+                raise IntegrityError("Mismatch between chunk count and MAC count")
+            
+            mac_chunks = [
+                (chunk_data, chunk_index, prime, mac)
+                for (chunk_data, chunk_index, prime), mac
+                in zip(phase_chunks, chunk_macs)
+            ]
+            
+            all_valid, failed_indices = self.mac_system.batch_verify_macs(
+                mac_chunks,
+                additional_data=f"{beacon_key}:{epoch}".encode()
+            )
+            
+            if not all_valid:
+                self.stats['mac_failures'] += 1
+                
+                if self.audit_logger:
+                    self.audit_logger.log_security_event(
+                        AuditEventType.INTEGRITY_VIOLATION,
+                        beacon_key,
+                        "failure",
+                        metadata={
+                            "reason": "mac_verification_failed",
+                            "failed_chunks": failed_indices,
+                            "epoch": epoch
+                        }
+                    )
+                
+                raise MACVerificationError(f"MAC verification failed for chunks: {failed_indices}")
+            
+            # All checks passed
+            return True
         
-        # Verify MAC if key provided
-        if mac_key is not None:
-            computed_mac = hmac.new(mac_key, payload, hashlib.sha256).digest()
-            if not hmac.compare_digest(computed_mac, mac):
-                return False, "MAC verification failed"
+        except ReplayAttackError:
+            self.stats['replay_attacks_blocked'] += 1
+            self.stats['integrity_violations'] += 1
+            raise
         
-        return True, "Valid"
+        except (MACVerificationError, IntegrityError):
+            self.stats['integrity_violations'] += 1
+            raise
+        
+        except Exception as e:
+            self.stats['integrity_violations'] += 1
+            
+            if self.audit_logger:
+                self.audit_logger.log_security_event(
+                    AuditEventType.INTEGRITY_VIOLATION,
+                    beacon_key,
+                    "error",
+                    metadata={
+                        "reason": "unexpected_error",
+                        "error": str(e),
+                        "epoch": epoch
+                    }
+                )
+            
+            raise IntegrityError(f"Integrity verification failed: {e}")
     
-    def accept_verified_beacon(
+    def create_protected_chunks(
         self,
-        key: str,
-        epoch: int,
-        nonce: Optional[bytes] = None
-    ) -> None:
+        beacon_key: str,
+        epoch: float,
+        phase_chunks: List[Tuple[bytes, int, int]]  # (data, index, prime)
+    ) -> List[bytes]:
         """
-        Accept a verified beacon.
+        Create MAC-protected phase chunks.
         
         Args:
-            key: Beacon key
+            beacon_key: Beacon key
             epoch: Beacon epoch
-            nonce: Optional nonce
+            phase_chunks: List of (chunk_data, chunk_index, prime) tuples
+            
+        Returns:
+            List of MAC values for the chunks
         """
-        self.replay_detector.accept_beacon(key, epoch, nonce)
+        chunk_macs = []
+        additional_data = f"{beacon_key}:{epoch}".encode()
+        
+        for chunk_data, chunk_index, prime in phase_chunks:
+            mac = self.mac_system.compute_mac(
+                chunk_data, chunk_index, prime, additional_data
+            )
+            chunk_macs.append(mac)
+        
+        return chunk_macs
+    
+    def cleanup_expired(self) -> int:
+        """Clean up expired replay detection records."""
+        return self.replay_detector.cleanup_expired()
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get combined integrity statistics."""
+        combined_stats = self.stats.copy()
+        combined_stats.update({
+            'mac_stats': self.mac_system.get_stats(),
+            'replay_stats': self.replay_detector.get_stats()
+        })
+        return combined_stats
+
+
+# Factory function for easy setup
+def create_integrity_manager(
+    mac_key: bytes,
+    audit_logger: Optional[AuditLogger] = None,
+    **kwargs
+) -> IntegrityManager:
+    """
+    Create and configure an integrity manager.
+    
+    Args:
+        mac_key: Key for MAC computation
+        audit_logger: Optional audit logger
+        **kwargs: Additional arguments for IntegrityManager
+        
+    Returns:
+        Configured integrity manager
+    """
+    return IntegrityManager(mac_key=mac_key, audit_logger=audit_logger, **kwargs)

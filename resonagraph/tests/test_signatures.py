@@ -1,231 +1,521 @@
 """
-Tests for signature management and Ed25519 operations.
+Test suite for Ed25519 signature management system.
 
-Tests signature key generation, rotation, verification, and trust management
-as specified in NEXT_STEPS.md 6.2.
+Tests the signature key manager, beacon signer, and signature verification
+components according to Phase 6B security specifications.
 """
 
-import time
 import pytest
+import time
+import secrets
+from typing import Dict, Any
+from unittest.mock import Mock, patch
 
-from resonagraph.security.signatures import SignatureKeyManager, SignatureKeyPair
-from cryptography.hazmat.primitives.asymmetric import ed25519
+from resonagraph.security.signatures import (
+    SignatureKeyManager, BeaconSigner,
+    create_signature_manager
+)
+from resonagraph.security.audit import AuditLogger
+from resonagraph.security.key_hierarchy import KeyHierarchy
 
 
 class TestSignatureKeyManager:
-    """Test SignatureKeyManager functionality."""
+    """Test the signature key manager."""
     
-    def test_initialization(self):
-        """Test key manager initialization."""
-        manager = SignatureKeyManager("node1")
-        
-        assert manager.node_id == "node1"
-        assert manager.rotation_interval == 86400 * 30  # 30 days
-        assert manager._current_key is None
-        assert manager._previous_key is None
+    @pytest.fixture
+    def audit_logger(self):
+        """Create a mock audit logger."""
+        return Mock(spec=AuditLogger)
     
-    def test_generate_key_pair(self):
-        """Test Ed25519 key pair generation."""
-        manager = SignatureKeyManager("node1")
-        key_pair = manager.generate_key_pair()
-        
-        assert isinstance(key_pair, SignatureKeyPair)
-        assert isinstance(key_pair.private_key, ed25519.Ed25519PrivateKey)
-        assert isinstance(key_pair.public_key, ed25519.Ed25519PublicKey)
-        assert key_pair.key_id.startswith("node1:")
-        assert key_pair.expires_at > key_pair.created_at
+    @pytest.fixture
+    def key_hierarchy(self):
+        """Create a mock key hierarchy."""
+        mock = Mock(spec=KeyHierarchy)
+        mock.derive_role_key.return_value = secrets.token_bytes(32)
+        return mock
     
-    def test_get_signing_key_auto_generates(self):
-        """Test that get_signing_key auto-generates if none exists."""
-        manager = SignatureKeyManager("node1")
-        
-        signing_key = manager.get_signing_key()
-        
-        assert isinstance(signing_key, ed25519.Ed25519PrivateKey)
-        assert manager._current_key is not None
+    def test_init(self, audit_logger):
+        """Test manager initialization."""
+        manager = SignatureKeyManager(node_id="test_node", audit_logger=audit_logger)
+        assert manager.audit_logger is audit_logger
+        assert manager.node_id == "test_node"
     
-    def test_get_current_key_id(self):
-        """Test getting current key ID."""
-        manager = SignatureKeyManager("node1")
+    def test_generate_signing_key(self, audit_logger):
+        """Test signing key generation."""
+        manager = SignatureKeyManager(node_id="test_node", audit_logger=audit_logger)
         
-        key_id = manager.get_current_key_id()
+        key_id = manager.generate_key_pair()
         
-        assert isinstance(key_id, str)
-        assert key_id.startswith("node1:")
+        # Verify key was generated
+        assert key_id is not None
+        assert "test_node" in key_id
+        
+        # Verify key can be retrieved
+        key_info = manager.get_key_info()
+        assert key_info is not None
+        assert key_info.key_id == key_id
+        
+        # Verify audit log was called
+        audit_logger.log_security_event.assert_called()
     
-    def test_rotate_key(self):
+    def test_import_public_key(self, audit_logger):
+        """Test importing public key from another node."""
+        manager = SignatureKeyManager(node_id="test_node", audit_logger=audit_logger)
+        
+        # Generate a test key to get PEM format
+        from cryptography.hazmat.primitives.asymmetric import ed25519
+        from cryptography.hazmat.primitives import serialization
+        
+        test_key = ed25519.Ed25519PrivateKey.generate()
+        public_key_pem = test_key.public_key().public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo
+        ).decode('utf-8')
+        
+        # Import the public key
+        manager.import_public_key("remote_node:123", public_key_pem)
+        
+        # Verify key was imported
+        known_keys = manager.list_known_keys()
+        assert "remote_node:123" in known_keys
+        
+        # Verify audit log
+        audit_logger.log_security_event.assert_called()
+    
+    def test_export_public_key(self, audit_logger):
+        """Test public key export."""
+        manager = SignatureKeyManager(node_id="test_node", audit_logger=audit_logger)
+        
+        # Generate a key
+        key_id = manager.generate_key_pair()
+        
+        # Export public key
+        public_key_pem = manager.export_public_key()
+        assert public_key_pem is not None
+        assert "BEGIN PUBLIC KEY" in public_key_pem
+    
+    def test_rotate_key(self, audit_logger):
         """Test key rotation."""
-        manager = SignatureKeyManager("node1")
-        
-        # Get initial key
-        key1_id = manager.get_current_key_id()
-        
-        # Rotate
-        time.sleep(0.01)  # Ensure different timestamp
-        new_key = manager.rotate_key()
-        
-        assert new_key.key_id != key1_id
-        assert manager.get_current_key_id() == new_key.key_id
-        assert manager._previous_key is not None
-        assert manager._previous_key.key_id == key1_id
-    
-    def test_rotated_key_in_trusted_keys(self):
-        """Test that rotated keys are added to trusted keys."""
-        manager = SignatureKeyManager("node1")
+        manager = SignatureKeyManager(node_id="test_node", audit_logger=audit_logger)
         
         # Generate initial key
-        key1_id = manager.get_current_key_id()
+        old_key_id = manager.generate_key_pair()
+        old_key_info = manager.get_key_info()
         
-        # Rotate
-        manager.rotate_key()
-        key2_id = manager.get_current_key_id()
-        
-        # Both keys should be trusted
-        trusted = manager.get_trusted_keys()
-        assert key1_id in trusted
-        assert key2_id in trusted
-    
-    def test_add_trusted_key(self):
-        """Test adding trusted keys from other nodes."""
-        manager = SignatureKeyManager("node1")
-        
-        # Generate a key from another "node"
-        other_key = ed25519.Ed25519PrivateKey.generate()
-        other_public = other_key.public_key()
-        
-        # Add to trusted keys
-        manager.add_trusted_key("node2:123456", other_public)
-        
-        trusted = manager.get_trusted_keys()
-        assert "node2:123456" in trusted
-    
-    def test_revoke_key(self):
-        """Test key revocation."""
-        manager = SignatureKeyManager("node1")
-        
-        key_id = manager.get_current_key_id()
-        
-        # Key should be valid initially
-        assert manager.is_key_valid(key_id)
-        
-        # Revoke key
-        manager.revoke_key(key_id)
-        
-        # Key should no longer be valid
-        assert not manager.is_key_valid(key_id)
-        assert key_id not in manager.get_trusted_keys()
-    
-    def test_verify_signature_with_current_key(self):
-        """Test signature verification with current key."""
-        manager = SignatureKeyManager("node1")
-        
-        # Sign a message
-        message = b"test message"
-        signing_key = manager.get_signing_key()
-        signature = signing_key.sign(message)
-        
-        # Verify with key ID
-        key_id = manager.get_current_key_id()
-        assert manager.verify_signature(message, signature, key_id=key_id)
-    
-    def test_verify_signature_with_public_key(self):
-        """Test signature verification with explicit public key."""
-        manager = SignatureKeyManager("node1")
-        
-        # Sign a message
-        message = b"test message"
-        signing_key = manager.get_signing_key()
-        signature = signing_key.sign(message)
-        public_key = manager._current_key.public_key
-        
-        # Verify with public key directly
-        assert manager.verify_signature(message, signature, public_key=public_key)
-    
-    def test_verify_signature_fails_wrong_message(self):
-        """Test that signature verification fails with wrong message."""
-        manager = SignatureKeyManager("node1")
-        
-        # Sign a message
-        message = b"test message"
-        signing_key = manager.get_signing_key()
-        signature = signing_key.sign(message)
-        
-        # Verify with different message
-        key_id = manager.get_current_key_id()
-        assert not manager.verify_signature(b"wrong message", signature, key_id=key_id)
-    
-    def test_verify_signature_fails_revoked_key(self):
-        """Test that signature verification fails for revoked keys."""
-        manager = SignatureKeyManager("node1")
-        
-        # Sign a message
-        message = b"test message"
-        signing_key = manager.get_signing_key()
-        signature = signing_key.sign(message)
-        key_id = manager.get_current_key_id()
-        
-        # Revoke key
-        manager.revoke_key(key_id)
-        
-        # Verification should fail
-        assert not manager.verify_signature(message, signature, key_id=key_id)
-    
-    def test_export_import_public_key(self):
-        """Test public key export and import."""
-        manager1 = SignatureKeyManager("node1")
-        manager2 = SignatureKeyManager("node2")
-        
-        # Export node1's public key
-        key_id = manager1.get_current_key_id()
-        pem_data = manager1.export_public_key()
-        
-        # Import into node2
-        manager2.import_public_key(key_id, pem_data)
-        
-        # Sign with node1, verify with node2
-        message = b"test message"
-        signing_key = manager1.get_signing_key()
-        signature = signing_key.sign(message)
-        
-        assert manager2.verify_signature(message, signature, key_id=key_id)
-    
-    def test_auto_rotation_on_expiry(self):
-        """Test automatic key rotation when key expires."""
-        # Very short rotation interval for testing
-        manager = SignatureKeyManager("node1", rotation_interval=0.1)
-        
-        # Get initial key
-        key1_id = manager.get_current_key_id()
-        
-        # Wait for expiry
-        time.sleep(0.15)
-        
-        # Getting signing key should trigger rotation
-        signing_key = manager.get_signing_key()
-        key2_id = manager.get_current_key_id()
-        
-        assert key1_id != key2_id
-        assert manager._previous_key is not None
-    
-    def test_verify_with_previous_key_during_rotation(self):
-        """Test that previous key remains valid during rotation."""
-        manager = SignatureKeyManager("node1")
-        
-        # Sign with initial key
-        message = b"test message"
-        signing_key1 = manager.get_signing_key()
-        signature1 = signing_key1.sign(message)
-        key1_id = manager.get_current_key_id()
+        # Sleep briefly to ensure different timestamp
+        import time
+        time.sleep(1)
         
         # Rotate key
-        time.sleep(0.01)
-        manager.rotate_key()
+        new_key_id = manager.rotate_key()
         
-        # Sign with new key
-        signing_key2 = manager.get_signing_key()
-        signature2 = signing_key2.sign(message)
-        key2_id = manager.get_current_key_id()
+        # Verify new key was created
+        assert new_key_id != old_key_id
+        new_key_info = manager.get_key_info()
+        assert new_key_info is not None
+        assert new_key_info.key_id == new_key_id
         
-        # Both signatures should verify
-        assert manager.verify_signature(message, signature1, key_id=key1_id)
-        assert manager.verify_signature(message, signature2, key_id=key2_id)
+        # Verify keys are different
+        assert old_key_info.public_key_pem != new_key_info.public_key_pem
+        
+        # Verify audit logging
+        assert audit_logger.log_security_event.call_count >= 2
+    
+    def test_revoke_key(self, audit_logger):
+        """Test key revocation."""
+        manager = SignatureKeyManager(node_id="test_node", audit_logger=audit_logger)
+        
+        # Import a key to revoke
+        from cryptography.hazmat.primitives.asymmetric import ed25519
+        from cryptography.hazmat.primitives import serialization
+        
+        test_key = ed25519.Ed25519PrivateKey.generate()
+        public_key_pem = test_key.public_key().public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo
+        ).decode('utf-8')
+        
+        key_id = "revokable_key"
+        manager.import_public_key(key_id, public_key_pem)
+        
+        # Revoke key
+        manager.revoke_key(key_id)
+        
+        # Verify key is marked as revoked
+        known_keys = manager.list_known_keys()
+        assert known_keys[key_id].revoked is True
+        
+        # Verify audit logging
+        audit_logger.log_security_event.assert_called()
+    
+    def test_cleanup_expired_keys(self, audit_logger):
+        """Test cleanup of expired keys."""
+        manager = SignatureKeyManager(node_id="test_node", audit_logger=audit_logger)
+        
+        # Import keys with different expiry times
+        from cryptography.hazmat.primitives.asymmetric import ed25519
+        from cryptography.hazmat.primitives import serialization
+        
+        current_time = time.time()
+        
+        # Import expired key
+        test_key = ed25519.Ed25519PrivateKey.generate()
+        public_key_pem = test_key.public_key().public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo
+        ).decode('utf-8')
+        
+        manager.import_public_key("expired_key", public_key_pem, current_time - 3600)
+        manager.import_public_key("valid_key", public_key_pem, current_time + 3600)
+        
+        # Run cleanup
+        cleaned_count = manager.cleanup_expired_keys()
+        
+        # Verify expired key was removed
+        assert cleaned_count == 1
+        known_keys = manager.list_known_keys()
+        assert "expired_key" not in known_keys
+        assert "valid_key" in known_keys
+    
+    def test_performance_metrics(self, audit_logger):
+        """Test performance metrics collection."""
+        manager = SignatureKeyManager(node_id="test_node", audit_logger=audit_logger)
+        
+        # Perform some operations
+        key_id = manager.generate_key_pair()
+        data = b"test data"
+        signature = manager.sign_data(data)
+        
+        # Check stats
+        stats = manager.get_stats()
+        assert stats["keys_rotated"] >= 1
+        assert stats["signatures_created"] >= 1
+
+
+class TestBeaconSigner:
+    """Test the beacon signing component."""
+    
+    @pytest.fixture
+    def signature_manager(self):
+        """Create a signature manager for testing."""
+        audit_logger = Mock(spec=AuditLogger)
+        manager = SignatureKeyManager(node_id="test_node", audit_logger=audit_logger)
+        
+        # Generate a test key
+        key_id = manager.generate_key_pair()
+        
+        # Import our own public key for verification testing
+        public_key_pem = manager.export_public_key()
+        manager.import_public_key(key_id, public_key_pem)
+        
+        return manager
+    
+    def test_init(self, signature_manager):
+        """Test signer initialization."""
+        signer = BeaconSigner(signature_manager)
+        assert signer.signature_manager is signature_manager
+    
+    def test_sign_beacon_data(self, signature_manager):
+        """Test beacon data signing."""
+        signer = BeaconSigner(signature_manager)
+        
+        # Test data
+        beacon_key = "test_beacon"
+        primes = [2, 3, 5, 7]
+        phase_fingerprint = 0x123456789ABCDEF0
+        epoch = time.time()
+        
+        # Sign the data
+        signature, key_id = signer.sign_beacon_data(
+            beacon_key=beacon_key,
+            primes=primes,
+            phase_fingerprint=phase_fingerprint,
+            epoch=epoch
+        )
+        
+        # Verify signature was created
+        assert signature is not None
+        assert len(signature) == 64  # Ed25519 signature length
+        assert key_id is not None
+    
+    def test_verify_beacon_signature(self, signature_manager):
+        """Test beacon signature verification."""
+        signer = BeaconSigner(signature_manager)
+        
+        # Test data
+        beacon_key = "test_beacon"
+        primes = [2, 3, 5, 7]
+        phase_fingerprint = 0x123456789ABCDEF0
+        epoch = time.time()
+        
+        # Sign the data
+        signature, key_id = signer.sign_beacon_data(
+            beacon_key=beacon_key,
+            primes=primes,
+            phase_fingerprint=phase_fingerprint,
+            epoch=epoch
+        )
+        
+        # Verify the signature
+        is_valid = signer.verify_beacon_signature(
+            beacon_key=beacon_key,
+            primes=primes,
+            phase_fingerprint=phase_fingerprint,
+            epoch=epoch,
+            signature=signature,
+            signer_key_id=key_id
+        )
+        
+        assert is_valid is True
+    
+    def test_verify_invalid_signature(self, signature_manager):
+        """Test verification of invalid signature."""
+        signer = BeaconSigner(signature_manager)
+        
+        # Test data
+        beacon_key = "test_beacon"
+        primes = [2, 3, 5, 7]
+        phase_fingerprint = 0x123456789ABCDEF0
+        epoch = time.time()
+        
+        # Create invalid signature
+        invalid_signature = secrets.token_bytes(64)
+        key_id = signature_manager.get_key_info().key_id
+        
+        # Verify should fail
+        is_valid = signer.verify_beacon_signature(
+            beacon_key=beacon_key,
+            primes=primes,
+            phase_fingerprint=phase_fingerprint,
+            epoch=epoch,
+            signature=invalid_signature,
+            signer_key_id=key_id
+        )
+        
+        assert is_valid is False
+    
+    def test_sign_with_additional_data(self, signature_manager):
+        """Test signing with additional authenticated data."""
+        signer = BeaconSigner(signature_manager)
+        
+        # Test data
+        beacon_key = "test_beacon"
+        primes = [2, 3, 5, 7]
+        phase_fingerprint = 0x123456789ABCDEF0
+        epoch = time.time()
+        additional_data = {"node_id": "test_node", "version": "1.0"}
+        
+        # Sign with additional data
+        signature, key_id = signer.sign_beacon_data(
+            beacon_key=beacon_key,
+            primes=primes,
+            phase_fingerprint=phase_fingerprint,
+            epoch=epoch,
+            additional_data=additional_data
+        )
+        
+        # Verify with same additional data
+        is_valid = signer.verify_beacon_signature(
+            beacon_key=beacon_key,
+            primes=primes,
+            phase_fingerprint=phase_fingerprint,
+            epoch=epoch,
+            signature=signature,
+            signer_key_id=key_id,
+            additional_data=additional_data
+        )
+        
+        assert is_valid is True
+        
+        # Verify should fail with different additional data
+        is_valid_wrong = signer.verify_beacon_signature(
+            beacon_key=beacon_key,
+            primes=primes,
+            phase_fingerprint=phase_fingerprint,
+            epoch=epoch,
+            signature=signature,
+            signer_key_id=key_id,
+            additional_data={"node_id": "different_node"}
+        )
+        
+        assert is_valid_wrong is False
+    
+    def test_performance_tracking(self, signature_manager):
+        """Test performance tracking in signer."""
+        signer = BeaconSigner(signature_manager)
+        
+        # Perform multiple operations
+        for i in range(5):
+            beacon_key = f"beacon_{i}"
+            primes = [2, 3, 5, 7]
+            phase_fingerprint = i
+            epoch = time.time()
+            
+            signature, key_id = signer.sign_beacon_data(
+                beacon_key=beacon_key,
+                primes=primes,
+                phase_fingerprint=phase_fingerprint,
+                epoch=epoch
+            )
+            
+            signer.verify_beacon_signature(
+                beacon_key=beacon_key,
+                primes=primes,
+                phase_fingerprint=phase_fingerprint,
+                epoch=epoch,
+                signature=signature,
+                signer_key_id=key_id
+            )
+        
+        # Check that metrics were updated
+        stats = signature_manager.get_stats()
+        assert stats["signatures_created"] >= 5
+        assert stats["signatures_verified"] >= 5
+
+
+class TestFactoryFunction:
+    """Test the factory function for creating signature managers."""
+    
+    def test_create_signature_manager_basic(self):
+        """Test basic signature manager creation."""
+        audit_logger = Mock(spec=AuditLogger)
+        
+        manager = create_signature_manager(node_id="test_node", audit_logger=audit_logger)
+        
+        assert isinstance(manager, SignatureKeyManager)
+        assert manager.audit_logger is audit_logger
+        assert manager.node_id == "test_node"
+    
+    def test_create_signature_manager_with_auto_key(self):
+        """Test signature manager creation with auto key generation."""
+        audit_logger = Mock(spec=AuditLogger)
+        
+        manager = create_signature_manager(
+            node_id="test_node",
+            audit_logger=audit_logger,
+            auto_generate_key=True
+        )
+        
+        assert isinstance(manager, SignatureKeyManager)
+        assert manager.audit_logger is audit_logger
+        assert manager.get_key_info() is not None
+    
+    def test_create_signature_manager_no_auto_key(self):
+        """Test signature manager creation without auto key generation."""
+        audit_logger = Mock(spec=AuditLogger)
+        
+        manager = create_signature_manager(
+            node_id="test_node",
+            audit_logger=audit_logger,
+            auto_generate_key=False
+        )
+        
+        assert isinstance(manager, SignatureKeyManager)
+        assert manager.get_key_info() is None
+
+
+class TestSignatureIntegration:
+    """Integration tests for the complete signature system."""
+    
+    def test_end_to_end_signing_workflow(self):
+        """Test complete signing workflow."""
+        # Create audit logger
+        audit_logger = Mock(spec=AuditLogger)
+        
+        # Create signature manager
+        manager = create_signature_manager(node_id="test_node", audit_logger=audit_logger)
+        
+        # Create signer
+        signer = BeaconSigner(manager)
+        
+        # Sign beacon data
+        beacon_key = "integration_test_beacon"
+        primes = [2, 3, 5, 7, 11, 13]
+        phase_fingerprint = 0xDEADBEEFCAFEBABE
+        epoch = time.time()
+        
+        signature, returned_key_id = signer.sign_beacon_data(
+            beacon_key=beacon_key,
+            primes=primes,
+            phase_fingerprint=phase_fingerprint,
+            epoch=epoch
+        )
+        
+        # Import our own public key for verification
+        public_key_pem = manager.export_public_key()
+        manager.import_public_key(returned_key_id, public_key_pem)
+        
+        # Verify signature
+        is_valid = signer.verify_beacon_signature(
+            beacon_key=beacon_key,
+            primes=primes,
+            phase_fingerprint=phase_fingerprint,
+            epoch=epoch,
+            signature=signature,
+            signer_key_id=returned_key_id
+        )
+        
+        assert is_valid is True
+        
+        # Rotate key and verify old signatures still work
+        new_key_id = manager.rotate_key()
+        
+        # Old signature should still verify
+        is_still_valid = signer.verify_beacon_signature(
+            beacon_key=beacon_key,
+            primes=primes,
+            phase_fingerprint=phase_fingerprint,
+            epoch=epoch,
+            signature=signature,
+            signer_key_id=returned_key_id
+        )
+        
+        assert is_still_valid is True
+    
+    def test_concurrent_signing_operations(self):
+        """Test concurrent signing operations."""
+        import threading
+        import concurrent.futures
+        
+        audit_logger = Mock(spec=AuditLogger)
+        manager = create_signature_manager(node_id="test_node", audit_logger=audit_logger)
+        signer = BeaconSigner(manager)
+        
+        # Import our own public key for verification
+        public_key_pem = manager.export_public_key()
+        key_id = manager.get_key_info().key_id
+        manager.import_public_key(key_id, public_key_pem)
+        
+        def sign_beacon(index):
+            """Sign a beacon in a thread."""
+            beacon_key = f"concurrent_beacon_{index}"
+            primes = [2, 3, 5, 7]
+            phase_fingerprint = index
+            epoch = time.time()
+            
+            signature, returned_key_id = signer.sign_beacon_data(
+                beacon_key=beacon_key,
+                primes=primes,
+                phase_fingerprint=phase_fingerprint,
+                epoch=epoch
+            )
+            
+            # Verify immediately
+            is_valid = signer.verify_beacon_signature(
+                beacon_key=beacon_key,
+                primes=primes,
+                phase_fingerprint=phase_fingerprint,
+                epoch=epoch,
+                signature=signature,
+                signer_key_id=returned_key_id
+            )
+            
+            return is_valid
+        
+        # Run concurrent signing operations
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            futures = [executor.submit(sign_beacon, i) for i in range(10)]
+            results = [future.result() for future in futures]
+        
+        # All signatures should be valid
+        assert all(results)

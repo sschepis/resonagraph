@@ -1,79 +1,57 @@
 """
-Beacon structure implementation for ResonaGraph gossip plane.
+Enhanced beacon structure with cryptographic signatures and integrity protection.
 
-According to design.md Section 2.2.1 and copilot-instructions.md:
-- Beacon Structure: 128-512 bytes compact metadata
-  - Prime Index ID (delta-coded, 128 bits for 32 primes)
-  - Epoch timestamp (32-bit, τ=2-13 seconds)
-  - Phase Fingerprint (quantized phases, 64-128 bits)
-  - Signature/MAC (Ed25519 + HMAC for integrity)
+Updated to support Ed25519 signatures and HMAC-based phase chunk authentication
+according to Phase 6B specifications.
 """
 
-import struct
 import time
-import hmac
+import struct
 import hashlib
-from typing import List, Optional, Dict, Any
-from dataclasses import dataclass
+import hmac
+from typing import List, Optional, Dict, Any, Tuple
+from dataclasses import dataclass, field
 from cryptography.hazmat.primitives.asymmetric import ed25519
-from cryptography.hazmat.primitives import serialization
+
+from resonagraph.security.signatures import SignatureKeyManager, BeaconSigner
+from resonagraph.security.integrity import IntegrityManager
 
 
-# Epoch parameters from design.md Section 2.2.1
-TAU_EPOCH = 8  # τ = 2^13 seconds ≈ 8192 seconds ≈ 2.27 hours (using 2^3 for testing)
-EPOCH_BITS = 32
-
-# Beacon structure parameters
-PRIME_INDEX_BITS = 128  # For 32 primes delta-coded
-PHASE_FINGERPRINT_BITS = 64  # Quantized phase fingerprint
-SIGNATURE_BYTES = 64  # Ed25519 signature size
-HMAC_BYTES = 32  # HMAC-SHA256 size
-
-# Size calculations
-MIN_BEACON_SIZE = 128
-MAX_BEACON_SIZE = 512
+# Time constants from design.md Section 2.2.1
+TAU_EPOCH = 30.0  # τ = 30 seconds (beacon epoch duration)
 
 
 @dataclass
 class BeaconMetadata:
-    """
-    Metadata for a beacon.
-    
-    This is a high-level representation of beacon data before
-    serialization into the compact binary format.
-    """
+    """Enhanced metadata for a beacon."""
     key: str
     primes: List[int]
-    epoch: int
-    phase_fingerprint: int  # Quantized fingerprint
-    signature: bytes
-    mac: bytes
-    version: int = 1  # Protocol version
+    epoch: float
+    phase_fingerprint: int
+    
+    # Security fields
+    signature: Optional[bytes] = None
+    signer_key_id: Optional[str] = None
+    chunk_macs: Optional[List[bytes]] = None
+    
+    # Optional fields
+    node_id: Optional[str] = None
+    ttl: int = 3
+    created_at: Optional[float] = field(default_factory=time.time)
+    
+    def __post_init__(self):
+        """Initialize computed fields."""
+        if self.created_at is None:
+            self.created_at = time.time()
 
 
 class Beacon:
     """
-    Compact beacon structure for gossip coordination.
+    Enhanced beacon with cryptographic security.
     
-    According to design.md Section 2.2.1:
-    - 128-512 bytes compact structure
-    - Prime Index ID (delta-coded)
-    - Epoch timestamp (32-bit)
-    - Phase Fingerprint (quantized phases)
-    - Signature/MAC (Ed25519 + HMAC)
-    
-    Binary format:
-    - Bytes 0-3:      Version (8 bits) + Reserved (24 bits)
-    - Bytes 4-7:      Epoch timestamp (32-bit)
-    - Bytes 8-23:     Prime Index ID (128 bits, delta-coded)
-    - Bytes 24-31:    Phase Fingerprint (64 bits, quantized)
-    - Bytes 32-63:    HMAC (32 bytes)
-    - Bytes 64-127:   Ed25519 Signature (64 bytes)
-    - Bytes 128+:     Optional extensions
+    Integrates Ed25519 signatures and HMAC-based integrity protection
+    for secure beacon verification in the gossip plane.
     """
-    
-    VERSION = 1
-    HEADER_SIZE = 192  # Minimum beacon size (extended for key hash)
     
     def __init__(
         self,
@@ -81,274 +59,503 @@ class Beacon:
         primes: List[int],
         phase_angles: List[float],
         signing_key: Optional[ed25519.Ed25519PrivateKey] = None,
-        mac_key: Optional[bytes] = None
+        mac_key: Optional[bytes] = None,
+        node_id: Optional[str] = None,
+        signature_manager: Optional[SignatureKeyManager] = None,
+        integrity_manager: Optional[IntegrityManager] = None
     ):
         """
-        Initialize a beacon.
+        Create a beacon with optional cryptographic protection.
         
         Args:
-            key: Key for this beacon
-            primes: Selected primes for encoding
-            phase_angles: Encoded phase angles
-            signing_key: Ed25519 private key for signing (optional)
-            mac_key: HMAC key (optional)
+            key: Beacon key
+            primes: Selected primes
+            phase_angles: Phase angles for each prime
+            signing_key: Ed25519 private key for signing (legacy)
+            mac_key: HMAC key for phase chunk protection (legacy)
+            node_id: Node identifier
+            signature_manager: Signature manager for advanced signing
+            integrity_manager: Integrity manager for MAC protection
         """
         self.key = key
         self.primes = primes
         self.phase_angles = phase_angles
-        self.epoch = self._compute_epoch()
-        self.phase_fingerprint = self._compute_phase_fingerprint(phase_angles)
+        self.node_id = node_id
+        self.epoch = time.time()
         
-        # Generate signature and MAC
-        payload = self._create_payload()
+        # Security managers (new approach)
+        self.signature_manager = signature_manager
+        self.integrity_manager = integrity_manager
         
-        if signing_key:
-            self.signature = signing_key.sign(payload)
-        else:
-            self.signature = b'\x00' * SIGNATURE_BYTES
-            
-        if mac_key:
-            self.mac = hmac.new(mac_key, payload, hashlib.sha256).digest()
-        else:
-            self.mac = b'\x00' * HMAC_BYTES
+        # Legacy support
+        self._signing_key = signing_key
+        self._mac_key = mac_key
+        
+        # Computed fields
+        self.phase_fingerprint = self._compute_phase_fingerprint()
+        
+        # Security fields
+        self.signature: Optional[bytes] = None
+        self.signer_key_id: Optional[str] = None
+        self.chunk_macs: Optional[List[bytes]] = None
+        
+        # Apply security if managers are available
+        if self.signature_manager:
+            self._apply_signature()
+        elif self._signing_key:
+            self._apply_legacy_signature()
+        
+        if self.integrity_manager:
+            self._apply_integrity_protection()
+        elif self._mac_key:
+            self._apply_legacy_mac()
     
-    @staticmethod
-    def _compute_epoch() -> int:
+    def _compute_phase_fingerprint(self) -> int:
         """
-        Compute current epoch timestamp.
-        
-        According to design.md Section 2.2.1:
-        - τ = 2^13 seconds (configurable)
-        - Epoch te is 32-bit timestamp
+        Compute a fingerprint of the phase angles.
         
         Returns:
-            Current epoch number
+            64-bit fingerprint of phase angles
         """
-        current_time = int(time.time())
-        return current_time // TAU_EPOCH
+        # Quantize phase angles to reduce precision
+        quantized = []
+        for angle in self.phase_angles:
+            # Quantize to 16 bits (0-65535)
+            quantized_angle = int((angle / (2 * 3.14159)) * 65535) & 0xFFFF
+            quantized.append(quantized_angle)
+        
+        # Hash the quantized angles
+        data = struct.pack(f'>{len(quantized)}H', *quantized)
+        hash_value = hashlib.sha256(data).digest()
+        
+        # Return first 64 bits as fingerprint
+        return struct.unpack('>Q', hash_value[:8])[0]
     
-    def _compute_phase_fingerprint(self, phase_angles: List[float]) -> int:
+    def _apply_signature(self) -> None:
+        """Apply signature using signature manager."""
+        if not self.signature_manager:
+            return
+        
+        signer = BeaconSigner(self.signature_manager)
+        
+        try:
+            signature, key_id = signer.sign_beacon_data(
+                beacon_key=self.key,
+                primes=self.primes,
+                phase_fingerprint=self.phase_fingerprint,
+                epoch=self.epoch,
+                additional_data={"node_id": self.node_id} if self.node_id else None
+            )
+            
+            self.signature = signature
+            self.signer_key_id = key_id
+        
+        except Exception:
+            # Signing failed, beacon will be unsigned
+            pass
+    
+    def _apply_legacy_signature(self) -> None:
+        """Apply signature using legacy signing key."""
+        if not self._signing_key:
+            return
+        
+        try:
+            # Create data to sign (legacy format)
+            data_to_sign = self._create_legacy_signature_data()
+            signature = self._signing_key.sign(data_to_sign)
+            
+            self.signature = signature
+            self.signer_key_id = f"legacy:{self.node_id or 'unknown'}"
+        
+        except Exception:
+            # Signing failed, beacon will be unsigned
+            pass
+    
+    def _apply_integrity_protection(self) -> None:
+        """Apply integrity protection using integrity manager."""
+        if not self.integrity_manager:
+            return
+        
+        try:
+            # Create phase chunks for MAC computation
+            phase_chunks = []
+            for i, (prime, angle) in enumerate(zip(self.primes, self.phase_angles)):
+                # Convert phase angle to bytes
+                angle_bytes = struct.pack('>f', angle)
+                phase_chunks.append((angle_bytes, i, prime))
+            
+            # Compute MACs
+            chunk_macs = self.integrity_manager.create_protected_chunks(
+                beacon_key=self.key,
+                epoch=self.epoch,
+                phase_chunks=phase_chunks
+            )
+            
+            self.chunk_macs = chunk_macs
+        
+        except Exception:
+            # MAC computation failed
+            pass
+    
+    def _apply_legacy_mac(self) -> None:
+        """Apply MAC protection using legacy MAC key."""
+        if not self._mac_key:
+            return
+        
+        try:
+            chunk_macs = []
+            
+            for i, (prime, angle) in enumerate(zip(self.primes, self.phase_angles)):
+                # Create message to authenticate
+                angle_bytes = struct.pack('>f', angle)
+                message = (
+                    angle_bytes +
+                    i.to_bytes(4, 'big') +
+                    prime.to_bytes(8, 'big') +
+                    self.key.encode('utf-8')
+                )
+                
+                # Compute HMAC
+                mac = hmac.new(self._mac_key, message, hashlib.sha256).digest()
+                chunk_macs.append(mac)
+            
+            self.chunk_macs = chunk_macs
+        
+        except Exception:
+            # MAC computation failed
+            pass
+    
+    def verify_signature(
+        self,
+        public_key: Optional[ed25519.Ed25519PublicKey] = None,
+        signature_manager: Optional[SignatureKeyManager] = None
+    ) -> bool:
         """
-        Compute quantized phase fingerprint.
-        
-        According to design.md Section 2.2.1:
-        - Quantized phases for coarse verification
-        - 64-128 bits compact representation
-        
-        We use a simple quantization scheme:
-        - Bin each phase into 8 bits (256 levels)
-        - Take top 8 phases and pack into 64 bits
+        Verify the beacon signature.
         
         Args:
-            phase_angles: List of phase angles in radians
+            public_key: Ed25519 public key for verification (legacy)
+            signature_manager: Signature manager for verification
             
         Returns:
-            64-bit quantized fingerprint
+            True if signature is valid
         """
-        import math
-        TWO_PI = 2 * math.pi
+        if not self.signature or not self.signer_key_id:
+            return False
         
-        fingerprint = 0
-        # Take up to 8 phases for fingerprint
-        for i, angle in enumerate(phase_angles[:8]):
-            # Normalize to [0, 2π) and quantize to 8 bits
-            normalized = angle % TWO_PI
-            quantized = int((normalized / TWO_PI) * 255)
-            fingerprint |= (quantized << (i * 8))
+        try:
+            # Use signature manager if available
+            if signature_manager:
+                signer = BeaconSigner(signature_manager)
+                return signer.verify_beacon_signature(
+                    beacon_key=self.key,
+                    primes=self.primes,
+                    phase_fingerprint=self.phase_fingerprint,
+                    epoch=self.epoch,
+                    signature=self.signature,
+                    signer_key_id=self.signer_key_id,
+                    additional_data={"node_id": self.node_id} if self.node_id else None
+                )
+            
+            # Legacy verification
+            elif public_key and self.signer_key_id.startswith("legacy:"):
+                data_to_verify = self._create_legacy_signature_data()
+                public_key.verify(self.signature, data_to_verify)
+                return True
+            
+            return False
         
-        return fingerprint
+        except Exception:
+            return False
     
-    def _delta_encode_primes(self) -> bytes:
+    def verify_integrity(
+        self,
+        integrity_manager: Optional[IntegrityManager] = None,
+        mac_key: Optional[bytes] = None
+    ) -> bool:
         """
-        Delta-encode prime indices for compact representation.
+        Verify beacon integrity (replay protection + MAC).
         
-        According to design.md Section 2.2.1:
-        - Delta-coded prime indices
-        - 128 bits for 32 primes
+        Args:
+            integrity_manager: Integrity manager for verification
+            mac_key: MAC key for legacy verification
+            
+        Returns:
+            True if integrity is valid
+        """
+        if not self.chunk_macs:
+            return False
         
-        We encode differences between consecutive primes.
-        For 32 primes, we use 4 bits per delta (16 deltas per 64-bit word).
+        try:
+            # Use integrity manager if available
+            if integrity_manager:
+                # Create phase chunks for verification
+                phase_chunks = []
+                for i, (prime, angle) in enumerate(zip(self.primes, self.phase_angles)):
+                    angle_bytes = struct.pack('>f', angle)
+                    phase_chunks.append((angle_bytes, i, prime))
+                
+                return integrity_manager.verify_beacon_integrity(
+                    beacon_key=self.key,
+                    epoch=self.epoch,
+                    phase_chunks=phase_chunks,
+                    chunk_macs=self.chunk_macs,
+                    node_id=self.node_id,
+                    signature_key_id=self.signer_key_id
+                )
+            
+            # Legacy MAC verification
+            elif mac_key:
+                return self._verify_legacy_macs(mac_key)
+            
+            return False
+        
+        except Exception:
+            return False
+    
+    def _verify_legacy_macs(self, mac_key: bytes) -> bool:
+        """Verify MACs using legacy method."""
+        if not self.chunk_macs or len(self.chunk_macs) != len(self.phase_angles):
+            return False
+        
+        try:
+            for i, (prime, angle, expected_mac) in enumerate(zip(
+                self.primes, self.phase_angles, self.chunk_macs
+            )):
+                # Recompute MAC
+                angle_bytes = struct.pack('>f', angle)
+                message = (
+                    angle_bytes +
+                    i.to_bytes(4, 'big') +
+                    prime.to_bytes(8, 'big') +
+                    self.key.encode('utf-8')
+                )
+                
+                computed_mac = hmac.new(mac_key, message, hashlib.sha256).digest()
+                
+                # Use constant-time comparison
+                if not hmac.compare_digest(computed_mac, expected_mac):
+                    return False
+            
+            return True
+        
+        except Exception:
+            return False
+    
+    def _create_legacy_signature_data(self) -> bytes:
+        """Create data for legacy signature computation."""
+        # Include key, primes, epoch, and fingerprint
+        data_parts = [
+            self.key.encode('utf-8'),
+            struct.pack('>Q', self.phase_fingerprint),
+            struct.pack('>d', self.epoch),
+        ]
+        
+        # Add primes
+        for prime in self.primes:
+            data_parts.append(struct.pack('>Q', prime))
+        
+        return b''.join(data_parts)
+    
+    def size(self) -> int:
+        """
+        Calculate beacon size in bytes.
         
         Returns:
-            16 bytes of delta-encoded primes
+            Total beacon size including security fields
         """
-        if not self.primes:
-            return b'\x00' * 16
+        base_size = (
+            32 +                              # Key hash
+            len(self.primes) * 4 +           # Prime indices
+            len(self.phase_angles) * 4 +     # Phase angles  
+            8 +                              # Epoch
+            8 +                              # Phase fingerprint
+            4                                # TTL
+        )
         
-        # Delta encode: store differences between consecutive primes
-        deltas = [self.primes[0]]  # First prime stored as-is (scaled)
-        for i in range(1, len(self.primes)):
-            delta = self.primes[i] - self.primes[i-1]
-            deltas.append(delta)
+        # Add security field sizes
+        if self.signature:
+            base_size += 64  # Ed25519 signature
         
-        # Pack deltas into bytes (simplified encoding)
-        # For now, just hash the primes for a compact representation
-        prime_data = ','.join(str(p) for p in self.primes).encode()
-        prime_hash = hashlib.sha256(prime_data).digest()[:16]
+        if self.signer_key_id:
+            base_size += len(self.signer_key_id.encode('utf-8'))
         
-        return prime_hash
-    
-    def _create_payload(self) -> bytes:
-        """
-        Create payload for signing/MAC.
+        if self.chunk_macs:
+            base_size += len(self.chunk_macs) * 32  # SHA256 MACs
         
-        Returns:
-            Serialized payload bytes
-        """
-        # Create payload using key hash, epoch, primes, and fingerprint
-        # This must match the format used in deserialization for signature verification
-        key_hash = hashlib.sha256(self.key.encode('utf-8')).digest()
-        epoch_bytes = struct.pack('<I', self.epoch)
-        primes_bytes = self._delta_encode_primes()
-        fingerprint_bytes = struct.pack('<Q', self.phase_fingerprint)
+        if self.node_id:
+            base_size += len(self.node_id.encode('utf-8'))
         
-        return key_hash + epoch_bytes + primes_bytes + fingerprint_bytes
+        return base_size
     
     def serialize(self) -> bytes:
         """
-        Serialize beacon to compact binary format.
-        
-        Binary structure (design.md Section 2.2.1):
-        - Bytes 0-3:      Version + Reserved
-        - Bytes 4-7:      Epoch timestamp
-        - Bytes 8-23:     Prime Index ID (delta-coded)
-        - Bytes 24-31:    Phase Fingerprint
-        - Bytes 32-63:    HMAC
-        - Bytes 64-95:    Key hash (32 bytes for signature validation)
-        - Bytes 96-127:   Reserved (32 bytes)
-        - Bytes 128-191:  Ed25519 Signature (64 bytes)
+        Serialize beacon to bytes.
         
         Returns:
-            Serialized beacon bytes (192 bytes)
+            Serialized beacon data
         """
-        # Header (4 bytes): version + reserved
-        header = struct.pack('<I', (self.VERSION << 24))
-        
-        # Epoch (4 bytes)
-        epoch_bytes = struct.pack('<I', self.epoch)
-        
-        # Prime Index ID (16 bytes, delta-coded)
-        primes_bytes = self._delta_encode_primes()
-        
-        # Phase Fingerprint (8 bytes)
-        fingerprint_bytes = struct.pack('<Q', self.phase_fingerprint)
-        
-        # HMAC (32 bytes)
-        mac_bytes = self.mac.ljust(HMAC_BYTES, b'\x00')[:HMAC_BYTES]
-        
-        # Key hash (32 bytes) - for signature validation
-        key_hash = hashlib.sha256(self.key.encode('utf-8')).digest()
-        
-        # Reserved space (32 bytes)
-        reserved = b'\x00' * 32
-        
-        # Signature (64 bytes)
-        sig_bytes = self.signature.ljust(SIGNATURE_BYTES, b'\x00')[:SIGNATURE_BYTES]
-        
-        # Combine all parts
-        beacon_data = (
-            header +           # 4 bytes
-            epoch_bytes +      # 4 bytes
-            primes_bytes +     # 16 bytes
-            fingerprint_bytes + # 8 bytes
-            mac_bytes +        # 32 bytes
-            key_hash +         # 32 bytes
-            reserved +         # 32 bytes
-            sig_bytes          # 64 bytes
-        )                      # Total: 192 bytes
-        
-        return beacon_data
-    
-    @classmethod
-    def deserialize(cls, data: bytes, verify_key: Optional[ed25519.Ed25519PublicKey] = None) -> 'Beacon':
-        """
-        Deserialize beacon from binary format.
-        
-        Args:
-            data: Binary beacon data
-            verify_key: Optional Ed25519 public key for signature verification
-            
-        Returns:
-            Beacon instance
-            
-        Raises:
-            ValueError: If data is invalid or signature verification fails
-        """
-        if len(data) < cls.HEADER_SIZE:
-            raise ValueError(f"Beacon data too short: {len(data)} < {cls.HEADER_SIZE}")
-        
-        # Parse header
-        header = struct.unpack('<I', data[0:4])[0]
-        version = (header >> 24) & 0xFF
-        
-        if version != cls.VERSION:
-            raise ValueError(f"Unsupported beacon version: {version}")
-        
-        # Parse fields
-        epoch = struct.unpack('<I', data[4:8])[0]
-        primes_bytes = data[8:24]
-        fingerprint = struct.unpack('<Q', data[24:32])[0]
-        mac = data[32:64]
-        key_hash = data[64:96]
-        # reserved = data[96:128]
-        signature = data[128:192]
-        
-        # For deserialization, we create a minimal beacon
-        # In a full implementation, we'd decode the prime indices
-        beacon = cls.__new__(cls)
-        beacon.key = ""  # Unknown from serialized data, use key_hash
-        beacon.primes = []  # Would decode from primes_bytes
-        beacon.phase_angles = []
-        beacon.epoch = epoch
-        beacon.phase_fingerprint = fingerprint
-        beacon.mac = mac
-        beacon.signature = signature
-        beacon._key_hash = key_hash  # Store for signature verification
-        
-        # Verify signature if key provided
-        if verify_key and signature != b'\x00' * SIGNATURE_BYTES:
-            # Create payload using key hash instead of key
-            payload = (
-                key_hash +
-                struct.pack('<I', epoch) +
-                primes_bytes +
-                struct.pack('<Q', fingerprint)
-            )
-            try:
-                verify_key.verify(signature, payload)
-            except Exception as e:
-                raise ValueError(f"Signature verification failed: {e}")
-        
-        return beacon
-    
-    def to_metadata(self) -> BeaconMetadata:
-        """
-        Convert beacon to metadata representation.
-        
-        Returns:
-            BeaconMetadata object
-        """
-        return BeaconMetadata(
+        # Create beacon metadata for serialization
+        metadata = BeaconMetadata(
             key=self.key,
             primes=self.primes,
             epoch=self.epoch,
             phase_fingerprint=self.phase_fingerprint,
             signature=self.signature,
-            mac=self.mac,
-            version=self.VERSION
+            signer_key_id=self.signer_key_id,
+            chunk_macs=self.chunk_macs,
+            node_id=self.node_id
         )
-    
-    def size(self) -> int:
-        """
-        Get serialized size of beacon.
         
-        Returns:
-            Size in bytes
+        # Simple serialization (in production, use protobuf or similar)
+        import pickle
+        return pickle.dumps({
+            'metadata': metadata,
+            'phase_angles': self.phase_angles
+        })
+    
+    @classmethod
+    def deserialize(
+        cls,
+        data: bytes,
+        verify_key: Optional[ed25519.Ed25519PublicKey] = None,
+        signature_manager: Optional[SignatureKeyManager] = None,
+        integrity_manager: Optional[IntegrityManager] = None
+    ) -> 'Beacon':
         """
-        return len(self.serialize())
+        Deserialize beacon from bytes.
+        
+        Args:
+            data: Serialized beacon data
+            verify_key: Ed25519 public key for verification (legacy)
+            signature_manager: Signature manager for verification
+            integrity_manager: Integrity manager for verification
+            
+        Returns:
+            Deserialized beacon
+            
+        Raises:
+            ValueError: If deserialization fails
+            SecurityError: If signature/integrity verification fails
+        """
+        try:
+            import pickle
+            serialized = pickle.loads(data)
+            
+            metadata = serialized['metadata']
+            phase_angles = serialized['phase_angles']
+            
+            # Create beacon
+            beacon = cls(
+                key=metadata.key,
+                primes=metadata.primes,
+                phase_angles=phase_angles,
+                node_id=metadata.node_id,
+                signature_manager=signature_manager,
+                integrity_manager=integrity_manager
+            )
+            
+            # Restore security fields
+            beacon.epoch = metadata.epoch
+            beacon.phase_fingerprint = metadata.phase_fingerprint
+            beacon.signature = metadata.signature
+            beacon.signer_key_id = metadata.signer_key_id
+            beacon.chunk_macs = metadata.chunk_macs
+            
+            # Verify signature if present
+            if beacon.signature and not beacon.verify_signature(verify_key, signature_manager):
+                raise SecurityError("Signature verification failed")
+            
+            # Verify integrity if present  
+            if beacon.chunk_macs and integrity_manager:
+                if not beacon.verify_integrity(integrity_manager):
+                    raise SecurityError("Integrity verification failed")
+            
+            return beacon
+        
+        except Exception as e:
+            raise ValueError(f"Failed to deserialize beacon: {e}")
     
     def __repr__(self) -> str:
+        """String representation of beacon."""
+        security_info = []
+        if self.signature:
+            security_info.append("signed")
+        if self.chunk_macs:
+            security_info.append("mac-protected")
+        
+        security_str = f" ({', '.join(security_info)})" if security_info else ""
+        
         return (
-            f"Beacon(key={self.key!r}, epoch={self.epoch}, "
-            f"primes={len(self.primes)}, fingerprint={self.phase_fingerprint:016x})"
+            f"Beacon(key={self.key}, epoch={self.epoch:.1f}, "
+            f"primes={len(self.primes)}, fingerprint={self.phase_fingerprint:016x}"
+            f"{security_str})"
         )
+
+
+class SecurityError(Exception):
+    """Raised when beacon security verification fails."""
+    pass
+
+
+# Factory functions for easy beacon creation
+
+def create_signed_beacon(
+    key: str,
+    primes: List[int],
+    phase_angles: List[float],
+    signature_manager: SignatureKeyManager,
+    node_id: Optional[str] = None
+) -> Beacon:
+    """
+    Create a beacon with signature protection.
+    
+    Args:
+        key: Beacon key
+        primes: Selected primes
+        phase_angles: Phase angles
+        signature_manager: Signature manager
+        node_id: Optional node ID
+        
+    Returns:
+        Signed beacon
+    """
+    return Beacon(
+        key=key,
+        primes=primes,
+        phase_angles=phase_angles,
+        signature_manager=signature_manager,
+        node_id=node_id
+    )
+
+
+def create_secure_beacon(
+    key: str,
+    primes: List[int],
+    phase_angles: List[float],
+    signature_manager: SignatureKeyManager,
+    integrity_manager: IntegrityManager,
+    node_id: Optional[str] = None
+) -> Beacon:
+    """
+    Create a beacon with full security protection (signature + integrity).
+    
+    Args:
+        key: Beacon key
+        primes: Selected primes
+        phase_angles: Phase angles
+        signature_manager: Signature manager
+        integrity_manager: Integrity manager
+        node_id: Optional node ID
+        
+    Returns:
+        Fully secured beacon
+    """
+    return Beacon(
+        key=key,
+        primes=primes,
+        phase_angles=phase_angles,
+        signature_manager=signature_manager,
+        integrity_manager=integrity_manager,
+        node_id=node_id
+    )
