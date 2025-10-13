@@ -17,7 +17,7 @@
 
 ## Overview
 
-ResonaGraph is a revolutionary distributed graph database that replaces traditional data replication with **resonance beacons** - achieving **80-90% bandwidth savings** while maintaining eventual consistency through thermodynamic principles.
+ResonaGraph is a distributed graph database that replaces traditional data replication with **resonance beacons** - achieving **80-90% bandwidth savings** while maintaining eventual consistency through thermodynamic principles.
 
 ### Core Innovation
 
