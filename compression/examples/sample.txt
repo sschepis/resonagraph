@@ -1,0 +1,20 @@
+Hello, ResonaCompress!
+
+This is a sample text file for demonstrating the ResonaCompress file compression algorithm.
+
+ResonaCompress uses phase-encoding principles from the ResonaGraph distributed graph database
+to compress files. Each byte is encoded as a set of phase angles in prime-indexed space, then
+reconstructed using the Chinese Remainder Theorem.
+
+While this produces larger files than traditional compression (due to storing phase angles),
+it demonstrates an interesting application of graph database concepts to file compression.
+
+Key features:
+- Phase encoding with golden ratio distribution
+- Chinese Remainder Theorem for reconstruction
+- Optional HMAC-based encryption
+- Checksum verification for integrity
+- Deterministic compression (same input = same output)
+
+This is primarily an educational tool to showcase the versatility of ResonaGraph's
+mathematical foundations.
