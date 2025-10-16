@@ -6,6 +6,7 @@
 *Phase-Modulated Superpositions over Prime-Based Hilbert Spaces*
 
 [![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![Node.js](https://img.shields.io/badge/node.js-18+-green.svg)](https://nodejs.org/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Tests](https://img.shields.io/badge/tests-220%20passing-brightgreen.svg)](#testing)
 
@@ -122,6 +123,52 @@ python -m pytest resonagraph/tests/ --cov=resonagraph
 # Specific modules
 python -m pytest resonagraph/tests/test_gpu_acceleration.py -v
 ```
+
+## JavaScript/TypeScript Port
+
+ResonaGraph is also available as a JavaScript/TypeScript library! The JavaScript port includes:
+
+- 🚀 **Full core functionality**: Phase encoding, resonance locking, CRT reconstruction
+- 🖥️ **Server process**: HTTP/WebSocket RPC node for distributed deployments
+- 💻 **CLI tool**: Command-line interface for easy interaction
+- 📦 **npm package**: Installable via npm (coming soon)
+- ✅ **23 passing tests**: Full test coverage of core modules
+
+### Quick Start (JavaScript)
+
+```typescript
+import { Client, PhaseKey } from 'resonagraph';
+
+const client = new Client('http://localhost:8443');
+const phaseKey = PhaseKey.fromPassphrase('my-secret');
+
+// Store data
+const beacon = client.put('user:alice', 
+  { name: 'Alice', email: 'alice@example.com' },
+  phaseKey
+);
+
+// Retrieve data
+const result = client.get('user:alice', phaseKey);
+console.log(result.payload);
+```
+
+### Install JavaScript Port
+
+```bash
+cd javascript
+npm install
+npm run build
+
+# Run the server
+npm run server
+
+# Use the CLI
+node dist/cli.js put user:alice '{"name":"Alice"}'
+node dist/cli.js get user:alice
+```
+
+See the [JavaScript README](javascript/README.md) for complete documentation.
 
 ## Architecture
 
