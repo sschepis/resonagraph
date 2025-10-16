@@ -13,6 +13,14 @@ dist/
 # Exclude files in src (source files stay)
 !src/**/*.js
 
+# Allow config files
+!jest.config.js
+!.eslintrc.js
+!.prettierrc.js
+
+# Allow example files
+!examples/**/*.js
+
 # Testing
 coverage/
 .nyc_output/
