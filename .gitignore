@@ -61,3 +61,10 @@ docs/_build/
 *.log
 *.tmp
 /tmp/
+
+# JavaScript/Node.js
+javascript/node_modules/
+javascript/dist/
+javascript/coverage/
+javascript/package-lock.json
+javascript/*.log
