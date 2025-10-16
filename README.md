@@ -10,7 +10,7 @@
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Tests](https://img.shields.io/badge/tests-220%20passing-brightgreen.svg)](#testing)
 
-[Quick Start](#quick-start) • [Documentation](#documentation) • [Examples](examples/) • [Papers](papers/)
+[Quick Start](#quick-start) • [Documentation](#documentation) • [Compression Tool](compression/) • [Examples](examples/) • [Papers](papers/)
 
 </div>
 
@@ -169,6 +169,51 @@ node dist/cli.js get user:alice
 ```
 
 See the [JavaScript README](javascript/README.md) for complete documentation.
+
+## ResonaCompress - File Compression
+
+ResonaGraph's phase-encoding principles have been reimagined as a **file compression tool**! While not optimized for production use, ResonaCompress demonstrates how graph database concepts can be applied to file compression.
+
+### Features
+
+- 🔢 **Phase Encoding**: File bytes encoded as phase angles in prime-indexed space
+- 🔐 **Optional Encryption**: Built-in HMAC-based cryptographic binding
+- ✅ **Lossless**: Uses Chinese Remainder Theorem for guaranteed exact reconstruction
+- 🎯 **Deterministic**: Same input always produces same output
+- 📊 **Checksum Verification**: SHA-256 integrity checking
+
+### Quick Start
+
+```bash
+cd compression
+npm install
+npm run build
+
+# Compress a file
+node dist/cli.js compress myfile.txt
+
+# View compressed file info
+node dist/cli.js info myfile.txt.resc
+
+# Decompress
+node dist/cli.js decompress myfile.txt.resc
+```
+
+### Example
+
+```bash
+# Compress with custom parameters
+node dist/cli.js compress document.txt -p 64 -a 0.1 -s
+
+# Output:
+# Original size:    1,234 bytes
+# Compressed size:  592,896 bytes (note: larger due to phase storage)
+# Time:             15ms
+```
+
+**Note**: ResonaCompress is an educational demonstration. The "compressed" files are actually larger than the originals due to storing phase angles (48 × 8 bytes per input byte). Traditional compression algorithms (gzip, bzip2) will be faster and achieve better compression ratios.
+
+See the [Compression README](compression/README.md) for complete documentation.
 
 ## Architecture
 
