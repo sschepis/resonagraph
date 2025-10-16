@@ -1,0 +1,5 @@
+node_modules/
+dist/
+*.resc
+examples/restored.txt
+.DS_Store

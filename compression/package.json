@@ -1,0 +1,38 @@
+{
+  "name": "resonacompress",
+  "version": "1.0.0",
+  "description": "File compression tool based on ResonaGraph phase-encoding principles",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "resonacompress": "dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "jest",
+    "compress": "node dist/cli.js compress",
+    "decompress": "node dist/cli.js decompress"
+  },
+  "keywords": [
+    "compression",
+    "resonance",
+    "prime-numbers",
+    "phase-encoding",
+    "file-compression"
+  ],
+  "author": "Sebastian Schepis",
+  "license": "MIT",
+  "dependencies": {
+    "commander": "^11.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0",
+    "jest": "^29.0.0",
+    "@types/jest": "^29.0.0",
+    "ts-jest": "^29.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
